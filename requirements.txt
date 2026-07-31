@@ -1,4 +1,4 @@
-keyboard
+mss
 numpy
 pillow
 pyautogui

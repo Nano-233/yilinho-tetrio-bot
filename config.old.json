@@ -1,5 +1,5 @@
 {
-  "label": "Current layout (board left of center)",
+  "label": "Original layout (board right of center)",
   "screen_offset": [
     0,
     0
@@ -9,24 +9,24 @@
     956
   ],
   "board_top_left": [
-    295,
-    318
+    551,
+    317
   ],
   "board_bottom_right": [
-    535,
-    797
+    791,
+    798
   ],
   "next_piece_xy_0": [
-    597,
-    374
+    852,
+    375
   ],
   "next_piece_xy_4": [
-    596,
-    664
+    851,
+    666
   ],
   "held_piece_xy": [
-    214,
-    376
+    487,
+    373
   ],
   "move_delay_ms": 30,
   "action_delay_ms": 50,

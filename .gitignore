@@ -2,3 +2,6 @@ __pycache__/
 .venv
 .idea
 .kilocode
+snapshot.png
+held_crop.png
+board.png

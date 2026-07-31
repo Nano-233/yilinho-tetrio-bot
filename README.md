@@ -25,10 +25,14 @@ https://youtu.be/nqyY3mnWVAE
 
 The bot includes an interactive calibration wizard that captures your screen coordinates for accurate gameplay detection. This is much easier than manually editing coordinate values!
 
+### macOS note
+
+Global hotkeys (`=` / Escape) from the `keyboard` library do **not** work on macOS without root, and often not even then. This fork uses a **countdown capture** instead: press Enter in the terminal, swipe to TETR.IO, hover the spot, wait for capture. Key presses use `pyautogui` (needs Accessibility). Screen grabs use `mss` (needs Screen Recording).
+
 ### Running Calibration
 
 ```bash
-python bot.py --calibrate
+python3 bot.py --calibrate
 ```
 
 ### Calibration Steps
@@ -45,8 +49,9 @@ The wizard guides you through 5 steps to capture the necessary screen positions:
 
 ### Controls During Calibration
 
-- **Press `=`** - Capture the current mouse position
-- **Press `Escape`** - Cancel calibration and exit
+- **Press Enter** in the terminal to start a 5-second countdown
+- During the countdown, switch to TETR.IO and hover the target
+- Keep the mouse still until it prints `Captured: (x, y)`
 
 ### Configuration File
 
@@ -163,6 +168,48 @@ For optimal bot performance, configure TETR.IO with these settings:
 - **DAS**: 40ms
 - **SDF**: max
 
+## Keybinds
+
+The bot sends real keystrokes, so its binds **must match your TETR.IO controls**.
+Defaults are TETR.IO's stock layout:
+
+| Action | Default |
+|--------|---------|
+| Move left / right | `left` / `right` |
+| Soft drop | `down` |
+| Hard drop | `space` |
+| Rotate CW | `x` |
+| Rotate CCW | `z` |
+| Rotate 180 | `a` |
+| Hold | `c` |
+
+The calibration wizard prompts for these. You can also edit `keybinds` in `config.json`:
+
+```json
+"keybinds": {
+  "move_left": "a",
+  "move_right": "d",
+  "soft_drop": "s",
+  "hard_drop": "space",
+  "rotate_cw": "right",
+  "rotate_ccw": "left",
+  "rotate_180": "up",
+  "hold": "shift"
+}
+```
+
+## Verifying detection
+
+Before letting the bot play, check that it reads the board correctly:
+
+```bash
+python3 bot.py --use-config --test
+```
+
+It prints the detected next queue, held piece, and filled-cell count once a second
+without pressing any keys. If `held=None` persists or the queue looks wrong,
+re-run `--calibrate` and aim at the **colored blocks**, not the preview panel.
+
 ## Troubleshooting
 
 ### Calibration Issues
@@ -176,6 +223,10 @@ For optimal bot performance, configure TETR.IO with these settings:
 - **Bot moves incorrectly**: Re-calibrate to ensure accurate board detection
 - **Bot is slow**: Increase `--mp` value for more parallel processing
 - **Bot misses pieces**: Ensure the next piece and held piece positions are correctly calibrated
+- **`Held is None` then it freezes**: fixed — the held piece is identified by hue
+  now, so TETR.IO greying it out after a hold no longer breaks detection. The
+  loop also re-syncs the next queue instead of waiting forever for a change
+  that a locked hold key can never produce.
 
 ## Dependencies
 
