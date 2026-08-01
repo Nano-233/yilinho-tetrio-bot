@@ -5,3 +5,10 @@ __pycache__/
 snapshot.png
 held_crop.png
 board.png
+cold-clear-2/
+app_settings.json
+# Ad hoc capture-debugging screenshots — often grab the whole desktop
+# (browser tabs, bookmarks, etc.), not just the game. Don't commit these.
+debug_*.png
+snapshot_bettercam.png
+cc_commit.txt

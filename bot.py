@@ -12,10 +12,265 @@ import numpy as np
 import pyautogui
 from PIL import Image, ImageDraw
 
-from constants import colors, colors_name, tetris_pieces, NUM_ROW, NUM_COL
-from tetris_ai import find_best_move
+from constants import colors, colors_name, tetris_pieces, tetris_pieces_trimmed, NUM_ROW, NUM_COL
+from tetris_ai import find_best_move as find_best_move_legacy
+from tetris_ai import _get_board_terrain
 
 CONFIG_FILE = "config.json"
+
+_DPI_AWARE = False
+# bettercam: Desktop Duplication — needed when TETR.IO is on a discrete-GPU
+# monitor (mss BitBlt returns a black frame there).
+_BETTERCAM = None  # ((width, height, device, output), camera) | None
+_BETTERCAM_TRIED = False
+# DXGI's AcquireNextFrame(0, ...) is a non-blocking poll: grab() returns None
+# whenever the desktop hasn't repainted since the last grab, which happens
+# constantly when polling faster than the game redraws. That is NOT a
+# capture failure — the last frame is still accurate — but treating it like
+# one used to fall through to mss, which returns solid black on this GPU's
+# monitor. Cache the last good frame and reuse it instead.
+_BETTERCAM_LAST_FRAME = None
+_BETTERCAM_IMPORT_WARNED = False
+
+# DXGI VendorId: NVIDIA=0x10DE (4318), Intel=0x8086 (32902), AMD=0x1002
+_NVIDIA_VENDOR = 4318
+
+
+def _parse_bettercam_topology():
+    """List (device_idx, output_idx, w, h, primary, is_nvidia, name) without opening cams."""
+    import bettercam
+    import re
+
+    devices = {}  # idx -> (name, is_nvidia)
+    raw = bettercam.device_info().replace("\n", " ")
+    for m in re.finditer(r"Device\[(\d+)\]:<Device Name:(.+?)>", raw):
+        idx = int(m.group(1))
+        blob = m.group(2)
+        is_nv = ("NVIDIA" in blob.upper()) or (f"VendorId:{_NVIDIA_VENDOR}" in blob)
+        name = blob.split(" Dedicated")[0].strip()
+        devices[idx] = (name, is_nv)
+
+    outs = []
+    for m in re.finditer(
+        r"Device\[(\d+)\] Output\[(\d+)\]: Res:\((\d+), (\d+)\)[^\n]*Primary:(\w+)",
+        bettercam.output_info(),
+    ):
+        d, o = int(m.group(1)), int(m.group(2))
+        w, h = int(m.group(3)), int(m.group(4))
+        primary = m.group(5).lower() == "true"
+        name, is_nv = devices.get(d, (f"Device{d}", False))
+        outs.append((d, o, w, h, primary, is_nv, name))
+    return outs
+
+
+def _pick_bettercam_target(screen_resolution, screen_offset=None):
+    """Pick DXGI (device, output) for the game monitor — prefer NVIDIA, no probe creates."""
+    sw, sh = int(screen_resolution[0]), int(screen_resolution[1])
+    try:
+        outs = _parse_bettercam_topology()
+    except Exception as e:
+        print(f"bettercam topology parse failed: {e}", flush=True)
+        outs = []
+
+    if not outs:
+        # Last resort: try common pairs without blasting 4x4 creates
+        return _pick_bettercam_target_probe(screen_resolution)
+
+    scored = []
+    for d, o, w, h, primary, is_nv, name in outs:
+        if w <= 0 or h <= 0:
+            continue
+        if (w, h) == (sw, sh):
+            # Exact size: prefer NVIDIA, then non-primary (external) for laptop+dGPU setups
+            score = (0 if is_nv else 1, 0 if not primary else 1, d, o)
+            scored.append((score, d, o, w, h, is_nv, name))
+            continue
+        sx, sy = sw / w, sh / h
+        if abs(sx - sy) > 0.08:
+            continue
+        # Scale mismatch: worse than exact; still prefer NVIDIA
+        score = (2, abs(math.log(sx)), 0 if is_nv else 1, d, o)
+        scored.append((score, d, o, w, h, is_nv, name))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda t: t[0])
+    _, d, o, w, h, is_nv, name = scored[0]
+    return d, o, w, h, is_nv, name
+
+
+def _pick_bettercam_target_probe(screen_resolution):
+    """Fallback: open only NVIDIA-first candidates, never a 4x4 blast."""
+    import bettercam
+
+    sw, sh = int(screen_resolution[0]), int(screen_resolution[1])
+    # Prefer device 1 (typical dGPU) before 0 (iGPU)
+    order = [(1, 0), (0, 0), (1, 1), (0, 1), (2, 0), (2, 1)]
+    best = None
+    for d, o in order:
+        cam = None
+        try:
+            cam = bettercam.create(device_idx=d, output_idx=o, output_color="RGB")
+            w, h = int(cam.width), int(cam.height)
+        except Exception:
+            continue
+        finally:
+            if cam is not None:
+                try:
+                    cam.release()
+                except Exception:
+                    pass
+                try:
+                    del cam
+                except Exception:
+                    pass
+        if w <= 0 or h <= 0:
+            continue
+        if (w, h) == (sw, sh):
+            return (d, o, w, h, d >= 1, f"device{d}")
+        sx, sy = sw / w, sh / h
+        if abs(sx - sy) > 0.08:
+            continue
+        score = abs(math.log(sx))
+        cand = (score, d, o, w, h)
+        if best is None or cand[0] < best[0]:
+            best = cand
+    if best is None:
+        return None
+    return best[1], best[2], best[3], best[4], best[1] >= 1, f"device{best[1]}"
+
+
+def _grab_bettercam(screen_resolution, screen_offset=None):
+    """Grab via bettercam, resized to config resolution. None if unavailable."""
+    global _BETTERCAM, _BETTERCAM_TRIED, _BETTERCAM_LAST_FRAME, _BETTERCAM_IMPORT_WARNED
+    width, height = int(screen_resolution[0]), int(screen_resolution[1])
+    try:
+        import bettercam  # noqa: F401
+    except ImportError:
+        if not _BETTERCAM_IMPORT_WARNED:
+            _BETTERCAM_IMPORT_WARNED = True
+            print(
+                "bettercam not installed — using mss (may capture black on a "
+                "GPU-driven monitor). pip install bettercam to fix.",
+                flush=True,
+            )
+        return None
+
+    # Key includes device so a profile swap can reopen the right adapter
+    key = (width, height)
+    if _BETTERCAM is not None and _BETTERCAM[0][:2] != key:
+        try:
+            _BETTERCAM[1].release()
+        except Exception:
+            pass
+        _BETTERCAM = None
+        _BETTERCAM_TRIED = False
+        _BETTERCAM_LAST_FRAME = None
+
+    if _BETTERCAM is None and not _BETTERCAM_TRIED:
+        _BETTERCAM_TRIED = True
+        pick = _pick_bettercam_target(screen_resolution, screen_offset)
+        if pick is None:
+            print(
+                "bettercam: no matching output for "
+                f"{width}x{height} — falling back to mss (may capture black "
+                "on a GPU-driven monitor)",
+                flush=True,
+            )
+            return None
+        if len(pick) == 6:
+            d, o, nw, nh, is_nv, name = pick
+        else:
+            d, o, nw, nh = pick[:4]
+            is_nv, name = False, f"device{d}"
+        try:
+            # nvidia_gpu=True is CuPy color convert — more GPU load, not "pick NVIDIA".
+            # DXGI duplication already runs on the adapter that owns the output.
+            cam = bettercam.create(device_idx=d, output_idx=o, output_color="RGB")
+        except Exception as e:
+            print(f"bettercam open failed: {e}", flush=True)
+            return None
+        _BETTERCAM = ((width, height, d, o), cam)
+        tag = "NVIDIA" if is_nv else "non-NVIDIA"
+        print(
+            f"Capture: bettercam {tag} '{name}' device={d} output={o} "
+            f"native={nw}x{nh} -> config {width}x{height}",
+            flush=True,
+        )
+
+    if _BETTERCAM is None:
+        return None
+    frame = _BETTERCAM[1].grab()
+    if frame is None:
+        # No repaint since the last grab — briefly retry, then fall back to
+        # the last real frame (still accurate) rather than let the caller
+        # hit mss's black-frame path on this monitor.
+        for _ in range(5):
+            time.sleep(0.004)
+            frame = _BETTERCAM[1].grab()
+            if frame is not None:
+                break
+        if frame is None:
+            return _BETTERCAM_LAST_FRAME
+    img = Image.fromarray(frame)
+    if img.size != (width, height):
+        img = img.resize((width, height), Image.BILINEAR)
+    _BETTERCAM_LAST_FRAME = img
+    return img
+
+
+def capture_screen(screen_offset, screen_resolution):
+    """Grab a screen region. Coords match pyautogui / calibration.
+
+    Prefers bettercam (DXGI) so discrete-GPU monitors aren't black. Falls
+    back to mss. Resizes to screen_resolution so calibration coords line up.
+
+    Note: DXGI must capture from the GPU that *drives* that monitor (Intel for
+    the laptop panel, NVIDIA for a dGPU-attached display). That is not the same
+    as CUDA — enabling bettercam's nvidia_gpu flag would only add CuPy load.
+    """
+    ensure_dpi_awareness()
+    width, height = int(screen_resolution[0]), int(screen_resolution[1])
+
+    img = _grab_bettercam(screen_resolution, screen_offset)
+    if img is not None:
+        return img
+
+    left, top = screen_offset
+    with mss.MSS() as sct:
+        region = {
+            "left": int(left),
+            "top": int(top),
+            "width": max(1, width),
+            "height": max(1, height),
+        }
+        shot = sct.grab(region)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        if img.size != (width, height):
+            img = img.resize((width, height), Image.BILINEAR)
+        return img
+
+
+def ensure_dpi_awareness():
+    """Align mss/pyautogui with the UI's coordinate space.
+
+    Creating a Qt QApplication (if none exists) makes mss report the same
+    multi-monitor layout the overlay/calibration UI uses. Calling Win32
+    SetProcessDpiAwareness *before* Qt breaks secondary-monitor sizes on
+    scaled displays (1920 logical vs 2880 physical).
+    """
+    global _DPI_AWARE
+    if _DPI_AWARE:
+        return
+    try:
+        from PyQt5.QtWidgets import QApplication
+        if QApplication.instance() is None:
+            # ponytail: headless QApp so CLI --use-config matches UI-calibrated coords
+            QApplication([])
+    except Exception:
+        pass
+    _DPI_AWARE = True
+
 
 # Piece hues on PIL's 0-255 HSV scale, in the same order as `colors`.
 # Matching on hue (not raw RGB) survives TETR.IO greying out the held piece
@@ -31,6 +286,28 @@ PIECE_MIN_SAT = 80
 PIECE_MIN_VAL = 65
 PIECE_MAX_HUE_DIST = 8  # closest two piece hues are ~17.8 apart
 PIECE_MIN_PIXELS = 8
+# Garbage blocks are a flat grey (near-zero saturation) — unlike any piece
+# hue, so they need their own gate instead of a low sat/val fallback. A loose
+# "bright enough" fallback here previously also matched hue-independent bleed
+# from a custom (non-default) TETR.IO background, painting phantom blocks
+# wherever the scenery showed through the board. If your board background is
+# NOT fully opaque, board reads will be unreliable no matter the thresholds —
+# set it to a solid/opaque background in TETR.IO settings.
+GARBAGE_MAX_SAT = 25
+GARBAGE_MIN_VAL = 90
+
+
+def cell_filled(hue, sat, val) -> bool:
+    """True if a cell's sampled HSV pixels (each an array) look like a real
+    mino or garbage block, rather than empty board / ghost tint."""
+    hue, sat, val = np.asarray(hue), np.asarray(sat), np.asarray(val)
+    lit = (sat >= PIECE_MIN_SAT) & (val >= PIECE_MIN_VAL)
+    if np.any(lit):
+        dist = np.abs(hue[lit][:, None] - PIECE_HUES[None, :])
+        dist = np.minimum(dist, 255 - dist)
+        if np.any(dist.min(axis=1) <= PIECE_MAX_HUE_DIST):
+            return True
+    return bool(sat.mean() <= GARBAGE_MAX_SAT and val.mean() >= GARBAGE_MIN_VAL)
 # Greyed-out held piece after a hold — lower sat/val but hue still valid
 HELD_MIN_SAT = 35
 HELD_MIN_VAL = 30
@@ -41,7 +318,8 @@ QUEUE_READ_DELAY = 0.025
 MAX_UNREADABLE_POLLS = 40
 SPAWN_MASK_ROWS = 4       # top rows — active piece lives here, hide from AI
 LOCK_SETTLE_SEC = 0.08    # wait after hard drop before next read
-SPAWN_COLUMN = 3          # default piece spawn column for movement math
+SPAWN_COLUMN = 3          # default piece spawn column for movement math (legacy left-edge)
+SPAWN_CENTER_X = 4        # guideline SRS center x (Cold Clear / TBP)
 SPAWN_SETTLE_SEC = 0.12   # wait after queue shift before reading pieces
 DEFAULT_PAUSE_SEC = 3.0   # --pause: seconds to wait before each drop
 
@@ -75,30 +353,9 @@ def tap_key(key):
     pyautogui.keyUp(key)
 
 
-def capture_screen(screen_offset, screen_resolution):
-    """Grab a screen region. Coords match pyautogui / calibration (logical pixels).
-
-    If mss returns a HiDPI (Retina) bitmap larger than the requested region,
-    resize down so crop coordinates still line up.
-    """
-    left, top = screen_offset
-    width, height = screen_resolution
-    with mss.MSS() as sct:
-        region = {
-            "left": int(left),
-            "top": int(top),
-            "width": max(1, int(width)),
-            "height": max(1, int(height)),
-        }
-        shot = sct.grab(region)
-        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        if img.size != (width, height):
-            img = img.resize((width, height), Image.BILINEAR)
-        return img
-
-
 def monitor_containing(x, y):
     """Return the mss monitor dict that contains point (x, y)."""
+    ensure_dpi_awareness()
     with mss.MSS() as sct:
         for mon in sct.monitors[1:]:
             if (mon["left"] <= x < mon["left"] + mon["width"] and
@@ -142,11 +399,12 @@ def load_config(config_path=CONFIG_FILE):
     return None
 
 
-def save_config(config, config_path=CONFIG_FILE):
+def save_config(config, config_path=CONFIG_FILE, quiet=False):
     """Save configuration to JSON."""
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
-    print(f"\nConfiguration saved to {config_path}")
+    if not quiet:
+        print(f"\nConfiguration saved to {config_path}")
 
 
 def format_board_rows(board, rows=4):
@@ -475,6 +733,11 @@ class TetrioBot:
         keybinds=None,
         debug=False,
         pause_sec=0,
+        ai_engine="legacy",
+        cc_binary=None,
+        cc_weights=None,
+        play_mode="autodrop",
+        spin_ruleset="all_mini_plus",
     ):
         self.keys = dict(DEFAULT_KEYBINDS)
         if keybinds:
@@ -482,6 +745,18 @@ class TetrioBot:
         self.debug = debug or pause_sec > 0
         self.pause_sec = pause_sec
         self.move_count = 0
+        self.ai_engine = ai_engine or "legacy"
+        self.cc_binary = cc_binary
+        self.cc_weights = cc_weights
+        self.play_mode = play_mode or "autodrop"  # "autodrop" | "suggest"
+        try:
+            from spin_path import normalize_ruleset
+            self.spin_ruleset = normalize_ruleset(spin_ruleset)
+        except Exception:
+            self.spin_ruleset = spin_ruleset or "all_mini_plus"
+        # Optional callback: publish_ghost([(col, row_top), ...], label)
+        self.publish_ghost = None
+        self._cc_ai_board = None  # bottom-up board at last CC decision
         self.screen_offset = screen_offset
         self.screen_resolution = screen_resolution
         self.board_top_left = board_top_left
@@ -497,12 +772,17 @@ class TetrioBot:
             next_piece_xy_4
         )
         pixel_area = (y4 - y0) // NUM_COL
-        self.pixel_area_half = pixel_area // 2
+        self.pixel_area_half = max(1, pixel_area // 2)
         self.held_piece_xy = held_piece_xy
 
         self.pruning_moves = pruning_moves
         self.pruning_breadth = pruning_breadth
-        self.mp_pool = Pool(processes=mp) if mp > 1 else None
+        self._mp_workers = int(mp) if mp else 1
+        # Cold Clear is a single subprocess — a legacy mp Pool here only
+        # spawns ~16 idle Python processes and hangs on shutdown (AppHang).
+        self.mp_pool = None
+        if self.ai_engine != "cold_clear" and self._mp_workers > 1:
+            self.mp_pool = Pool(processes=self._mp_workers)
         
         # Delay settings
         self.move_delay_ms = move_delay_ms
@@ -512,9 +792,82 @@ class TetrioBot:
         self.last_good_next = None
         self.last_held_piece = None
         self.hold_used_this_piece = False
+        self._stop = False
 
         self.screen_image = Image.new("RGB", self.screen_resolution)
         self.refresh_screen_image()
+
+    def stop(self):
+        """Request exit ASAP — unblock CC suggest and release stuck keys."""
+        self._stop = True
+        try:
+            for k in set(self.keys.values()):
+                try:
+                    pyautogui.keyUp(k)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            from cold_clear import shutdown_shared_engine
+            shutdown_shared_engine()
+        except Exception:
+            pass
+
+    def _sleep(self, seconds: float) -> bool:
+        """Sleep in short slices; return False if stop was requested."""
+        if seconds <= 0:
+            return not self._stop
+        end = time.time() + seconds
+        while time.time() < end:
+            if self._stop:
+                return False
+            time.sleep(min(0.05, end - time.time()))
+        return not self._stop
+
+    def apply_config(self, config):
+        """Hot-reload geometry, delays, and keybinds from a profile dict."""
+        self.screen_offset = tuple(config["screen_offset"])
+        self.screen_resolution = tuple(config["screen_resolution"])
+        self.board_top_left = tuple(config["board_top_left"])
+        self.board_bottom_right = tuple(config["board_bottom_right"])
+        next_0 = tuple(config["next_piece_xy_0"])
+        next_4 = tuple(config["next_piece_xy_4"])
+        x0, y0 = next_0
+        x4, y4 = next_4
+        self.next_piece_xy = (
+            next_0,
+            ((x0 + x4) // 2, y0 + math.floor(((y4 - y0) / 4) * 1)),
+            ((x0 + x4) // 2, y0 + math.floor(((y4 - y0) / 4) * 2)),
+            ((x0 + x4) // 2, y0 + math.floor(((y4 - y0) / 4) * 3)),
+            next_4,
+        )
+        pixel_area = (y4 - y0) // NUM_COL
+        self.pixel_area_half = max(1, pixel_area // 2)
+        self.held_piece_xy = tuple(config["held_piece_xy"])
+        self.move_delay_ms = config.get("move_delay_ms", DEFAULT_MOVE_DELAY_MS)
+        self.action_delay_ms = config.get("action_delay_ms", DEFAULT_ACTION_DELAY_MS)
+        self.delay_variance_percent = config.get(
+            "delay_variance_percent", DEFAULT_DELAY_VARIANCE_PERCENT
+        )
+        self.keys = dict(DEFAULT_KEYBINDS)
+        self.keys.update(config.get("keybinds") or {})
+        if "pruning_moves" in config:
+            self.pruning_moves = config["pruning_moves"]
+        if "pruning_breadth" in config:
+            self.pruning_breadth = config["pruning_breadth"]
+        if "ai_engine" in config:
+            self.ai_engine = config["ai_engine"] or "legacy"
+        if "cc_binary" in config:
+            self.cc_binary = config.get("cc_binary")
+        if "cc_weights" in config:
+            self.cc_weights = config.get("cc_weights")
+        if "spin_ruleset" in config:
+            try:
+                from spin_path import normalize_ruleset
+                self.spin_ruleset = normalize_ruleset(config.get("spin_ruleset"))
+            except Exception:
+                self.spin_ruleset = config.get("spin_ruleset") or self.spin_ruleset
 
     def refresh_screen_image(self):
         self.screen_image = capture_screen(self.screen_offset, self.screen_resolution)
@@ -579,39 +932,55 @@ class TetrioBot:
             held = self.last_held_piece
         return held
 
+    def board_looks_obscured(self, board_image_L=None) -> bool:
+        """True if a bright overlay (e.g. OUT OF FOCUS) covers mid-board."""
+        if board_image_L is None:
+            board_image_L = self.screen_image.crop((
+                self.board_top_left[0],
+                self.board_top_left[1],
+                self.board_bottom_right[0],
+                self.board_bottom_right[1],
+            )).convert("L")
+        w, h = board_image_L.size
+        # Sample a horizontal band through mid-board (where the banner sits)
+        ys = (h // 2 - h // 20, h // 2, h // 2 + h // 20)
+        xs = (w // 4, w // 2, 3 * w // 4)
+        vals = [board_image_L.getpixel((x, y)) for y in ys for x in xs]
+        avg = sum(vals) / max(1, len(vals))
+        # Empty playfield is near-black; the white/red banner is very bright.
+        return avg > 120
+
     def get_tetris_board(self):
+        """Read filled cells from a 3x3 sample per cell (row 0 = top).
+
+        A cell counts as filled if either:
+          - it hue-matches a piece colour at the same sat/val floor already
+            validated for next-piece reads (`classify_piece`), or
+          - it's a flat grey at real-block brightness (garbage — garbage has
+            no hue at all, so it needs its own gate rather than a looser
+            catch-all that also matches translucent ghost-piece tint).
+        """
         board_image = self.screen_image.crop((
             self.board_top_left[0],
             self.board_top_left[1],
             self.board_bottom_right[0],
             self.board_bottom_right[1]
-        )).convert('L')
-        # board_image.save("board.png")
-        board = np.zeros((NUM_ROW, NUM_COL), dtype=np.int32)
+        )).convert('RGB')
+        hsv = np.array(board_image.convert('HSV'), dtype=np.int32)
+        img_h, img_w = hsv.shape[:2]
         block_width = board_image.width / NUM_COL
         block_height = board_image.height / NUM_ROW
 
-        for row in reversed(range(NUM_ROW)):
-            empty_row = True
+        board = np.zeros((NUM_ROW, NUM_COL), dtype=np.int32)
+        for row in range(NUM_ROW):
+            cy = math.floor(row * block_height + block_height / 2)
+            y0, y1 = max(0, cy - 1), min(img_h, cy + 2)
             for col in range(NUM_COL):
-                total_darkness = 0
-                num_pixels = 0
-                for dx in range(-1, 2):
-                    for dy in range(-1, 2):
-                        x = math.floor(col * block_width + block_width / 2) + dx
-                        y = math.floor(row * block_height + block_height / 2) + dy
-                        pixel_value = board_image.getpixel((x, y))
-                        total_darkness += pixel_value
-                        num_pixels += 1
-                avg_darkness = total_darkness / num_pixels
-
-                if avg_darkness < 30:
-                    board[row][col] = 0
-                else:
-                    empty_row = False
-                    board[row][col] = 1
-            if empty_row:
-                break
+                cx = math.floor(col * block_width + block_width / 2)
+                x0, x1 = max(0, cx - 1), min(img_w, cx + 2)
+                patch = hsv[y0:y1, x0:x1].reshape(-1, 3)
+                filled = cell_filled(patch[:, 0], patch[:, 1], patch[:, 2])
+                board[row][col] = 1 if filled else 0
         return board
 
     def place_piece(self, best_position, rotations, need_hold):
@@ -664,21 +1033,236 @@ class TetrioBot:
         tap_key(self.keys["hard_drop"])
         time.sleep(action_delay())
 
+    def _emit_ghost(self, cells, label=""):
+        cb = self.publish_ghost
+        if cb:
+            try:
+                cb(cells, label)
+            except Exception:
+                pass
+
+    def _clear_ghost(self):
+        self._emit_ghost([], "")
+
+    def _ghost_cells_legacy(self, ai_board, piece, position_col, rotations):
+        """Landing cells as (col, screen_row) with screen_row 0 = top."""
+        rot = rotations[0] if rotations else 0
+        shapes = tetris_pieces_trimmed[piece]
+        if piece in "SZI" and rot == 3:
+            shape, terrain = shapes[1]
+        else:
+            idx = rot if rot < len(shapes) else 0
+            shape, terrain = shapes[idx]
+        board_terrain = _get_board_terrain(ai_board)
+        x = int(position_col)
+        if x < 0 or x + len(terrain) > NUM_COL:
+            return []
+        row = max(board_terrain[x + i] - ht for i, ht in enumerate(terrain))
+        cells = []
+        for r in range(shape.shape[0]):
+            for c in range(shape.shape[1]):
+                if shape[r, c]:
+                    by = row + r
+                    bx = x + c
+                    if 0 <= by < NUM_ROW and 0 <= bx < NUM_COL:
+                        cells.append((bx, NUM_ROW - 1 - by))
+        return cells
+
+    def _ghost_cells_cc(self):
+        try:
+            from cold_clear import get_shared_engine, placement_minos
+            eng = get_shared_engine(self.cc_binary, self.cc_weights)
+            placement = getattr(eng, "last_placement", None)
+            if not placement:
+                return []
+            cells = []
+            for x, y in placement_minos(placement):
+                if 0 <= y < NUM_ROW and 0 <= x < NUM_COL:
+                    cells.append((x, NUM_ROW - 1 - y))
+            return cells
+        except Exception:
+            return []
+
+    def place_cc(self, center_x, rot_index, need_hold):
+        """Execute Cold Clear placement.
+
+        Non-spin: greedy rotate → shift → hard drop (reliable).
+        Spin: SRS BFS path so the last input can be a rotate.
+        """
+        from spin_path import (
+            CW, CCW, ROT180, LEFT, RIGHT, SD, HD,
+            path_for_placement, would_spin, pad_board,
+        )
+
+        move_delay = lambda: get_delay_with_variance(self.move_delay_ms, self.delay_variance_percent)
+        action_delay = lambda: get_delay_with_variance(self.action_delay_ms, self.delay_variance_percent)
+
+        placement = None
+        try:
+            from cold_clear import get_shared_engine
+            placement = getattr(
+                get_shared_engine(self.cc_binary, self.cc_weights),
+                "last_placement",
+                None,
+            )
+        except Exception:
+            placement = None
+
+        if need_hold:
+            tap_key(self.keys["hold"])
+            if not self._sleep(action_delay()):
+                return
+
+        spin = (placement or {}).get("spin", "none") or "none"
+        want_spin_path = spin in ("mini", "full")
+        if not want_spin_path and placement is not None and self._cc_ai_board is not None:
+            try:
+                loc = placement["location"]
+                want_spin_path = would_spin(
+                    self.spin_ruleset,
+                    loc["type"],
+                    pad_board(self._cc_ai_board),
+                    int(loc["x"]),
+                    int(loc["y"]),
+                    loc["orientation"],
+                )
+            except Exception:
+                want_spin_path = False
+
+        path = None
+        if want_spin_path and placement is not None and self._cc_ai_board is not None:
+            try:
+                path = path_for_placement(
+                    self._cc_ai_board, placement, self.spin_ruleset
+                )
+            except Exception as e:
+                print(f"spin path failed ({e}); using greedy", flush=True)
+
+        key_map = {
+            LEFT: self.keys["move_left"],
+            RIGHT: self.keys["move_right"],
+            CW: self.keys["rotate_cw"],
+            CCW: self.keys["rotate_ccw"],
+            ROT180: self.keys["rotate_180"],
+            HD: self.keys["hard_drop"],
+        }
+
+        def do_rotate(idx):
+            if self._stop:
+                return
+            if idx == 1:
+                tap_key(self.keys["rotate_cw"])
+            elif idx == 2:
+                tap_key(self.keys["rotate_180"])
+            elif idx == 3:
+                tap_key(self.keys["rotate_ccw"])
+            else:
+                return
+            self._sleep(action_delay())
+
+        def do_shift(cx):
+            dx = int(cx) - SPAWN_CENTER_X
+            if dx < 0:
+                for _ in range(-dx):
+                    if self._stop:
+                        return
+                    tap_key(self.keys["move_left"])
+                    if not self._sleep(move_delay()):
+                        return
+            elif dx > 0:
+                for _ in range(dx):
+                    if self._stop:
+                        return
+                    tap_key(self.keys["move_right"])
+                    if not self._sleep(move_delay()):
+                        return
+
+        if path:
+            print(f"  path: {' '.join(path)}", flush=True)
+            for action in path:
+                if self._stop:
+                    try:
+                        pyautogui.keyUp(self.keys["soft_drop"])
+                    except Exception:
+                        pass
+                    return
+                if action == SD:
+                    pyautogui.keyDown(self.keys["soft_drop"])
+                    if not self._sleep(soft_drop_delay):
+                        pyautogui.keyUp(self.keys["soft_drop"])
+                        return
+                    pyautogui.keyUp(self.keys["soft_drop"])
+                    if not self._sleep(move_delay()):
+                        return
+                elif action in key_map:
+                    tap_key(key_map[action])
+                    delay = action_delay() if action in (CW, CCW, ROT180, HD) else move_delay()
+                    if not self._sleep(delay):
+                        return
+            return
+
+        # Greedy non-spin (or spin fallback)
+        if self._stop:
+            return
+        print(
+            f"  greedy: rot={rot_index} x={center_x} spin={spin}",
+            flush=True,
+        )
+        if want_spin_path:
+            do_shift(center_x)
+            if self._stop:
+                return
+            pyautogui.keyDown(self.keys["soft_drop"])
+            if not self._sleep(soft_drop_delay):
+                pyautogui.keyUp(self.keys["soft_drop"])
+                return
+            do_rotate(rot_index)
+            pyautogui.keyUp(self.keys["soft_drop"])
+        else:
+            do_rotate(rot_index)
+            do_shift(center_x)
+        if self._stop:
+            return
+        tap_key(self.keys["hard_drop"])
+        self._sleep(action_delay())
+
     def run(self):
         combo = 0
         b2b = 0
 
         print("TetrioBot started. Waiting for game...", flush=True)
+        print(f"  engine={self.ai_engine}  spin_ruleset={getattr(self, 'spin_ruleset', '?')}",
+              flush=True)
         self.refresh_screen_image()
         last_next_pieces = self.read_next_pieces()
         print(f"Initial next pieces detected: {last_next_pieces}", flush=True)
+        if last_next_pieces is None or all(p is None for p in last_next_pieces):
+            means = []
+            for xy in self.next_piece_xy:
+                rgb = np.array(self.sample_box(xy)).reshape(-1, 3).mean(axis=0)
+                means.append(float(rgb.mean()))
+            if means and max(means) < 15:
+                print(
+                    "WARNING: next-piece samples are nearly black. "
+                    "TETR.IO must be visible on the calibrated monitor. "
+                    "If the overlay looks right but capture is black, you need "
+                    "bettercam (pip install bettercam opencv-python-headless) "
+                    "for discrete-GPU displays.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "WARNING: could not classify next queue — re-check next-piece "
+                    "calibration (green boxes must sit on the coloured minos).",
+                    flush=True,
+                )
         expected_board = np.zeros((NUM_ROW, NUM_COL), dtype=np.int32)
         poll_count = 0
         empty_hold_retries = 0
         unreadable = 0
-        while True:
+        while not self._stop:
             next_pieces = self.read_next_pieces()
-            while next_pieces == last_next_pieces:
+            while next_pieces == last_next_pieces and not self._stop:
                 poll_count += 1
                 unreadable_poll = next_pieces is None or all(
                     p is None for p in next_pieces
@@ -690,8 +1274,11 @@ class TetrioBot:
                 if poll_count % 100 == 0:
                     print(f"Polling for piece change... ({poll_count} iterations, "
                           f"current: {next_pieces})", flush=True)
-                time.sleep(wait_time)
+                if not self._sleep(wait_time):
+                    break
                 next_pieces = self.read_next_pieces()
+            if self._stop:
+                break
             poll_count = 0
             self.hold_used_this_piece = False
             self.last_good_next = None  # don't merge with stale cache after shift
@@ -709,6 +1296,8 @@ class TetrioBot:
                 continue
             unreadable = 0
             time.sleep(SPAWN_SETTLE_SEC)
+            if self._stop:
+                break
 
             # Falling piece = old next[0] before the queue shifted (queue inference
             # is reliable). Board color read fails on custom backgrounds — the
@@ -717,6 +1306,15 @@ class TetrioBot:
             current_piece = falling_piece
 
             raw_board = self.get_tetris_board()
+            if self.board_looks_obscured():
+                print(
+                    "Board looks obscured (window unfocused / covered?) — waiting.",
+                    flush=True,
+                )
+                time.sleep(0.25)
+                self.refresh_screen_image()
+                last_next_pieces = self.read_next_pieces()
+                continue
             # The falling piece sits in the top rows — including it makes the AI
             # think the stack is taller/wrong shape and pick bad placements.
             current_board = raw_board.copy()
@@ -747,19 +1345,50 @@ class TetrioBot:
                 empty_hold_retries = 0
 
             t1 = time.time()
-            # Screen scan uses row 0 = top; tetris_ai uses row 0 = bottom.
+            # Screen scan uses row 0 = top; AI engines use row 0 = bottom.
             ai_board = np.flipud(current_board)
-            score, (position, rotations, need_hold, combo, b2b, ai_expected) = find_best_move(
-                ai_board, current_piece, next_pieces, held_piece, combo, b2b,
-                self.pruning_moves,
-                self.pruning_breadth,
-                mp_pool=self.mp_pool,
-            )
+            if self.ai_engine == "cold_clear":
+                from cold_clear import find_best_move as find_best_move_cc
+                self._cc_ai_board = np.array(ai_board, dtype=np.int32).copy()
+                score, (position, rotations, need_hold, combo, b2b, ai_expected) = find_best_move_cc(
+                    ai_board, current_piece, next_pieces, held_piece, combo, b2b,
+                    self.pruning_moves,
+                    self.pruning_breadth,
+                    mp_pool=self.mp_pool,
+                    binary_path=self.cc_binary,
+                    config_path=self.cc_weights,
+                    spin_ruleset=self.spin_ruleset,
+                )
+            else:
+                score, (position, rotations, need_hold, combo, b2b, ai_expected) = find_best_move_legacy(
+                    ai_board, current_piece, next_pieces, held_piece, combo, b2b,
+                    self.pruning_moves,
+                    self.pruning_breadth,
+                    mp_pool=self.mp_pool,
+                )
             expected_board = np.flipud(ai_expected)
             t2 = time.time()
 
-            print(f"score: {round(score):6}   b2b: {b2b:2}    time: {t2-t1}",
+            print(f"nodes: {round(score):6}   b2b: {b2b:2}    time: {t2-t1:.3f}"
+                  f"   [{self.ai_engine}]  piece={falling_piece} cells={int(current_board.sum())}",
                   flush=True)
+            if self.ai_engine == "cold_clear":
+                try:
+                    from cold_clear import get_shared_engine
+                    pl = getattr(
+                        get_shared_engine(self.cc_binary, self.cc_weights),
+                        "last_placement",
+                        None,
+                    ) or {}
+                    loc = pl.get("location") or {}
+                    print(
+                        f"  CC place: {loc.get('type')} {loc.get('orientation')} "
+                        f"@x={loc.get('x')} y={loc.get('y')} "
+                        f"spin={pl.get('spin','none')} hold={need_hold}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             if t2 - t1 < wait_time:
                 time.sleep(wait_time - t2 + t1)
 
@@ -771,17 +1400,21 @@ class TetrioBot:
             if need_hold:
                 place_piece = next_pieces[0] if held_piece is None else held_piece
 
-            if place_piece in "SZI" and rotations[0] == 3:
-                best_piece_pos_rot = tetris_pieces[place_piece][1]
+            if self.ai_engine == "cold_clear":
+                target_col = position  # SRS center x for debug display
+                offset = 0
             else:
-                best_piece_pos_rot = tetris_pieces[place_piece][rotations[0]]
-            offset = 0
-            for i in range(best_piece_pos_rot.shape[1]):
-                if not any(best_piece_pos_rot[:, i]):
-                    offset += 1
+                if place_piece in "SZI" and rotations[0] == 3:
+                    best_piece_pos_rot = tetris_pieces[place_piece][1]
                 else:
-                    break
-            target_col = position - offset
+                    best_piece_pos_rot = tetris_pieces[place_piece][rotations[0]]
+                offset = 0
+                for i in range(best_piece_pos_rot.shape[1]):
+                    if not any(best_piece_pos_rot[:, i]):
+                        offset += 1
+                    else:
+                        break
+                target_col = position - offset
             if self.debug:
                 self.move_count += 1
                 print(f"\n{'='*44}", flush=True)
@@ -790,14 +1423,19 @@ class TetrioBot:
                 print(f"  FALLING piece : {falling_piece}", flush=True)
                 print(f"  NEXT preview  : {next_pieces}", flush=True)
                 print(f"  HELD          : {held_piece}", flush=True)
-                print(f"  TARGET column : {target_col}  (0=left, 9=right; ^ below)",
-                      flush=True)
+                if self.ai_engine == "cold_clear":
+                    print(f"  TARGET center : {position}  (spawn center={SPAWN_CENTER_X})",
+                          flush=True)
+                else:
+                    print(f"  TARGET column : {target_col}  (0=left, 9=right; ^ below)",
+                          flush=True)
                 print(f"  ROTATION      : {rotations}", flush=True)
                 print(f"  HOLD this move: {need_hold}", flush=True)
                 print(f"  AI score      : {round(score)}", flush=True)
                 print(f"\n  BOARD the AI sees (#=filled, top row=0, spawn masked):",
                       flush=True)
-                print(format_board_full(current_board, mark_col=target_col),
+                mark = target_col if self.ai_engine != "cold_clear" else None
+                print(format_board_full(current_board, mark_col=mark),
                       flush=True)
                 raw_cells = int(raw_board.sum())
                 ai_cells = int(current_board.sum())
@@ -807,22 +1445,143 @@ class TetrioBot:
                     print(format_board_full(raw_board), flush=True)
                 print(f"\n  EXPECTED board after drop:", flush=True)
                 print(format_board_full(expected_board), flush=True)
-                print(f"  KEYS: {describe_inputs(self.keys, position, rotations, need_hold, offset)}",
-                      flush=True)
+                if self.ai_engine != "cold_clear":
+                    print(f"  KEYS: {describe_inputs(self.keys, position, rotations, need_hold, offset)}",
+                          flush=True)
             if self.pause_sec > 0:
                 print(f"\n  >> dropping in {self.pause_sec:.0f}s — compare board above to screen\n",
                       flush=True)
                 time.sleep(self.pause_sec)
-            self.place_piece(target_col, rotations, need_hold)
+
+            # Ghost overlay (suggest mode always; also useful briefly in autodrop)
+            if self.ai_engine == "cold_clear":
+                ghost = self._ghost_cells_cc()
+            else:
+                ghost = self._ghost_cells_legacy(
+                    ai_board, place_piece, position, rotations
+                )
+            mode = self.play_mode
+            self._emit_ghost(
+                ghost,
+                f"{'HOLD+' if need_hold else ''}{place_piece} [{mode}]",
+            )
+
+            placed = False
+            decision_queue = list(next_pieces) if next_pieces is not None else None
+            while not self._stop:
+                mode = self.play_mode
+                if mode == "autodrop":
+                    if self.ai_engine == "cold_clear":
+                        self.place_cc(
+                            position, rotations[0] if rotations else 0, need_hold
+                        )
+                    else:
+                        self.place_piece(target_col, rotations, need_hold)
+                    placed = True
+                    break
+                # suggest: wait for manual drop (queue change) or switch to autodrop
+                if not self._sleep(0.05):
+                    break
+                cur = self.read_next_pieces()
+                if decision_queue is not None and cur != decision_queue:
+                    # User placed; sync to new queue and skip our keypresses
+                    last_next_pieces = cur
+                    self._clear_ghost()
+                    break
+
+            if not placed:
+                if self._stop:
+                    break
+                continue
+
+            self._clear_ghost()
             if need_hold:
                 self.hold_used_this_piece = True
                 self.last_held_piece = falling_piece
             time.sleep(get_delay_with_variance(
                 self.action_delay_ms, self.delay_variance_percent) + LOCK_SETTLE_SEC)
+        print("TetrioBot stopped.", flush=True)
+        self._clear_ghost()
+
+    def close(self):
+        """Release the multiprocessing pool / CC engine if any."""
+        if self.mp_pool is not None:
+            try:
+                self.mp_pool.terminate()
+                self.mp_pool.join()
+            except Exception:
+                try:
+                    self.mp_pool.close()
+                    self.mp_pool.join()
+                except Exception:
+                    pass
+            self.mp_pool = None
+        try:
+            from cold_clear import shutdown_shared_engine
+            shutdown_shared_engine()
+        except Exception:
+            pass
+
+
+def bot_from_config(config, debug=False, pause_sec=0):
+    """Build a TetrioBot from a profile/config dict."""
+    return TetrioBot(
+        screen_offset=tuple(config["screen_offset"]),
+        screen_resolution=tuple(config["screen_resolution"]),
+        board_top_left=tuple(config["board_top_left"]),
+        board_bottom_right=tuple(config["board_bottom_right"]),
+        next_piece_xy_0=tuple(config["next_piece_xy_0"]),
+        next_piece_xy_4=tuple(config["next_piece_xy_4"]),
+        held_piece_xy=tuple(config["held_piece_xy"]),
+        pruning_moves=config.get("pruning_moves", 5),
+        pruning_breadth=config.get("pruning_breadth", 5),
+        mp=config.get("mp", 16),
+        move_delay_ms=config.get("move_delay_ms", DEFAULT_MOVE_DELAY_MS),
+        action_delay_ms=config.get("action_delay_ms", DEFAULT_ACTION_DELAY_MS),
+        delay_variance_percent=config.get(
+            "delay_variance_percent", DEFAULT_DELAY_VARIANCE_PERCENT
+        ),
+        keybinds=config.get("keybinds"),
+        debug=debug,
+        pause_sec=pause_sec,
+        ai_engine=config.get("ai_engine", "legacy"),
+        cc_binary=config.get("cc_binary"),
+        cc_weights=config.get("cc_weights"),
+        play_mode=config.get("play_mode", "autodrop"),
+        spin_ruleset=config.get("spin_ruleset", "all_mini_plus"),
+    )
+
+
+def _self_check():
+    """Board-cell classification: piece colours, garbage, empty, ghost tint."""
+    for name, rgb in zip(colors_name, colors):
+        h, s, v = colorsys.rgb_to_hsv(*[c / 255 for c in rgb])
+        px = np.array([h, s, v]) * 255
+        assert cell_filled([px[0]] * 9, [px[1]] * 9, [px[2]] * 9), \
+            f"{name} piece colour should read as filled"
+
+    assert not cell_filled([0] * 9, [0] * 9, [10] * 9), \
+        "near-black empty board should read as empty"
+
+    assert cell_filled([0] * 9, [5] * 9, [130] * 9), \
+        "flat mid-grey garbage should read as filled"
+
+    # Ghost piece: real colour hue, but faded well below real-block sat/val —
+    # must NOT be counted, or the AI thinks a spawn preview is a locked block.
+    l_h, l_s, l_v = colorsys.rgb_to_hsv(*[c / 255 for c in colors[colors_name.index("L")]])
+    ghost = np.array([l_h * 255, l_s * 255 * 0.25, l_v * 255 * 0.35])
+    assert not cell_filled([ghost[0]] * 9, [ghost[1]] * 9, [ghost[2]] * 9), \
+        "faded ghost-piece tint should not read as filled"
+
+    print("bot self-check ok")
+
 
 
 def main():
+    ensure_dpi_awareness()
     parser = argparse.ArgumentParser(description='TetrioBot - An AI player for TETR.IO')
+    parser.add_argument('--self-check', action='store_true',
+                        help='Run offline vision self-check (no game needed) and exit')
     parser.add_argument('--calibrate', action='store_true',
                         help='Run the calibration wizard to configure screen coordinates')
     parser.add_argument('--use-config', action='store_true',
@@ -852,10 +1611,22 @@ def main():
                         help='Print full board + plan each move (auto --pause 5)')
     parser.add_argument('--pause', type=float, default=None, metavar='SEC',
                         help='Seconds before each drop (default: 5 with --debug, else 0)')
+    parser.add_argument('--ai-engine', choices=['legacy', 'cold_clear'], default=None,
+                        help='Heuristics engine: legacy (yilinho) or cold_clear')
+    parser.add_argument(
+        '--spin-ruleset',
+        choices=['t_spins', 'all_mini', 'all_mini_plus', 'all_spin', 'none'],
+        default=None,
+        help='TETR.IO spin detection preset (default: all_mini_plus)',
+    )
     parser.add_argument('--countdown', type=int, default=STARTUP_COUNTDOWN_SEC,
                         help=f'Seconds to wait before starting so you can switch windows (default: {STARTUP_COUNTDOWN_SEC})')
 
     args = parser.parse_args()
+
+    if args.self_check:
+        _self_check()
+        return
 
     if args.pause is None:
         args.pause = DEFAULT_PAUSE_SEC if args.debug else 0
@@ -912,6 +1683,10 @@ def main():
             keybinds=keybinds,
             debug=args.debug,
             pause_sec=args.pause,
+            ai_engine=args.ai_engine or config.get('ai_engine', 'legacy'),
+            cc_binary=config.get('cc_binary'),
+            cc_weights=config.get('cc_weights'),
+            spin_ruleset=args.spin_ruleset or config.get('spin_ruleset', 'all_mini_plus'),
         )
     else:
         # Use default/hardcoded values
@@ -941,6 +1716,8 @@ def main():
             delay_variance_percent=delay_variance_percent,
             debug=args.debug,
             pause_sec=args.pause,
+            ai_engine=args.ai_engine or 'legacy',
+            spin_ruleset=args.spin_ruleset or 'all_mini_plus',
         )
 
     if args.pause > 0:

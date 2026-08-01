@@ -2,3 +2,8 @@ mss
 numpy
 pillow
 pyautogui
+PythonOverlayLib
+PyQt5
+keyboard
+bettercam
+opencv-python-headless

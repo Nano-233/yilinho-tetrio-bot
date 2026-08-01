@@ -11,15 +11,36 @@ https://youtu.be/nqyY3mnWVAE
     pip install -r requirements.txt
     ```
 
-2. Run the calibration wizard (first time setup):
+2. **GUI (recommended on Windows):**
+    ```bash
+    python ui.py
+    ```
+    Use the control panel to calibrate (Capture buttons + overlay), edit delays/keybinds, switch profiles, and start/stop the bot. Global hotkeys default to **F6** start, **F7** stop, **F8** toggle overlay.
+
+3. Or use the CLI calibration wizard:
     ```bash
     python bot.py --calibrate
     ```
 
-3. Start the bot with your saved configuration:
+4. Start the bot from the CLI with your saved configuration:
     ```bash
     python bot.py --use-config
     ```
+
+## GUI
+
+`python ui.py` opens a PyQt5 control panel and a click-through overlay (PythonOverlayLib).
+
+| Area | What it does |
+|------|----------------|
+| Profiles | Dropdown + New / Duplicate / Delete. Stored in `profiles/*.json`. Active profile tracked in `app_settings.json`. First launch migrates `config.json` → `profiles/default.json`. |
+| Overlay | Toggle draws the board grid (yellow), next-piece sample boxes (green), and held sample (purple) over the screen so you can verify calibration. |
+| Calibration | Per-point **Capture** starts a countdown; hover the target in TETR.IO until it records. Overlay updates live. |
+| Delays / AI | Move/action delay, variance, multiprocessing workers, pruning — all editable without raw JSON. |
+| Keybinds | Game binds (must match TETR.IO) plus app hotkeys (start / stop / overlay). |
+| Save | Writes the active profile and app settings. Switching profiles while the bot is running stops it first (hot reload when idle). |
+
+CLI (`bot.py --use-config`, etc.) still works; saving from the UI also syncs `config.json` from the active profile.
 
 ## Calibration
 
@@ -161,6 +182,38 @@ next_piece_xy_4=(1260, 721),
 held_piece_xy=(691, 300),
 ```
 
+## Heuristics (Cold Clear 2)
+
+Delays / AI tab (or `--ai-engine`) switches between:
+
+| Engine | What it is |
+|--------|------------|
+| **Legacy (yilinho)** | Original `tetris_ai.py` + spin heuristics |
+| **Cold Clear 2** | MinusKelvin’s bot over TBP (subprocess) |
+
+### Play mode: Autodrop vs Suggest
+
+On the main panel (or **F9**):
+
+| Mode | Behavior |
+|------|----------|
+| **Autodrop** | Bot presses keys and places pieces |
+| **Suggest** | Bot only computes the move and draws a cyan ghost on the board overlay — you place manually |
+
+Suggest auto-shows the overlay window while a ghost is active. Start the bot in either mode; you can hotkey-toggle mid-run.
+
+Build the binary once (Rust required):
+
+```bash
+git clone https://github.com/MinusKelvin/cold-clear-2.git
+cd cold-clear-2
+cargo build --release
+```
+
+Pinned commit used during integration: see `cold-clear-2` checkout (`ed8b193`). Weights live in `cc_weights.json`. Path defaults to `cold-clear-2/target/release/cold-clear-2.exe`.
+
+Pathing uses an SRS BFS (CW/CCW/180/shift/soft-drop) and prefers rotate-last sequences when the selected **spin ruleset** would credit a spin. Match the TETR.IO room setting under Delays / AI → Spin ruleset (`t_spins`, `all_mini`, `all_mini_plus`, `all_spin`, `none`).
+
 ## Game Settings
 
 For optimal bot performance, configure TETR.IO with these settings:
@@ -231,9 +284,9 @@ re-run `--calibrate` and aim at the **colored blocks**, not the preview panel.
 ## Dependencies
 
 - Python 3.x
-- pyautogui
-- mss
-- numpy
+- pyautogui, mss, numpy, pillow
+- PyQt5, PythonOverlayLib (GUI overlay)
+- keyboard (global hotkeys, Windows)
 - See `requirements.txt` for full list
 
 ## Disclaimer
