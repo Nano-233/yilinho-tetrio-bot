@@ -31,6 +31,7 @@ DEFAULT_AI = {
     "pruning_breadth": 5,
     "ai_engine": "legacy",  # "legacy" | "cold_clear"
     "spin_ruleset": "all_mini_plus",
+    "cc_think_ms": 150,
 }
 
 
@@ -57,6 +58,7 @@ def normalize_profile(config):
     config.setdefault("pruning_breadth", DEFAULT_AI["pruning_breadth"])
     config.setdefault("ai_engine", DEFAULT_AI["ai_engine"])
     config.setdefault("spin_ruleset", DEFAULT_AI["spin_ruleset"])
+    config.setdefault("cc_think_ms", DEFAULT_AI["cc_think_ms"])
     binds = dict(DEFAULT_KEYBINDS)
     binds.update(config.get("keybinds") or {})
     config["keybinds"] = binds

@@ -46,5 +46,6 @@
   "pruning_breadth": 5,
   "ai_engine": "cold_clear",
   "spin_ruleset": "all_mini_plus",
+  "cc_think_ms": 150,
   "play_mode": "autodrop"
 }

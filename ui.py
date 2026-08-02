@@ -4,6 +4,7 @@ Entry: python ui.py
 """
 from __future__ import annotations
 
+import importlib
 import math
 import sys
 import traceback
@@ -29,6 +30,7 @@ from bot import (
     ensure_dpi_awareness,
     monitor_containing,
 )
+import bot as bot_module
 from constants import NUM_COL, NUM_ROW
 from profiles import (
     DEFAULT_APP_HOTKEYS,
@@ -268,7 +270,12 @@ class BotWorker(QtCore.QThread):
 
     def run(self):
         try:
-            self.bot = bot_from_config(self._config)
+            # ponytail: ui.py imports bot once at process start — reload so
+            # Stop/Start picks up edits without restarting ui.py.
+            import cold_clear
+            importlib.reload(cold_clear)
+            importlib.reload(bot_module)
+            self.bot = bot_module.bot_from_config(self._config)
             self.bot.play_mode = _STATE.get("play_mode", "autodrop")
             self.bot.publish_ghost = _publish_ghost_from_bot
             self.bot.run()
@@ -513,6 +520,14 @@ class ControlPanel(QtWidgets.QMainWindow):
                 self.spin_ruleset.addItem(label, key)
             self._default_spin_ruleset = "all_mini_plus"
         form.addRow("Spin ruleset", self.spin_ruleset)
+        self.cc_think_ms = QtWidgets.QSpinBox()
+        self.cc_think_ms.setRange(0, 2000)
+        self.cc_think_ms.setSuffix(" ms")
+        self.cc_think_ms.setValue(150)
+        self.cc_think_ms.setToolTip(
+            "Sleep before each Cold Clear suggest() so CC accumulates search nodes."
+        )
+        form.addRow("CC think time", self.cc_think_ms)
         self.ai_legacy.toggled.connect(self._sync_legacy_ai_controls)
         self.ai_cc.toggled.connect(self._sync_legacy_ai_controls)
         self._legacy_ai_widgets = (self.mp, self.pruning_moves, self.pruning_breadth)
@@ -554,6 +569,8 @@ class ControlPanel(QtWidgets.QMainWindow):
             w.setEnabled(legacy)
         if hasattr(self, "spin_ruleset"):
             self.spin_ruleset.setEnabled(not legacy)
+        if hasattr(self, "cc_think_ms"):
+            self.cc_think_ms.setEnabled(not legacy)
 
     def _refresh_profile_combo(self):
         self.profile_combo.blockSignals(True)
@@ -618,6 +635,8 @@ class ControlPanel(QtWidgets.QMainWindow):
         cfg["ai_engine"] = "cold_clear" if self.ai_cc.isChecked() else "legacy"
         if hasattr(self, "spin_ruleset"):
             cfg["spin_ruleset"] = self.spin_ruleset.currentData() or "all_mini_plus"
+        if hasattr(self, "cc_think_ms"):
+            cfg["cc_think_ms"] = self.cc_think_ms.value()
         binds = dict(DEFAULT_KEYBINDS)
         for key, edit in self.game_bind_edits.items():
             val = edit.text().strip().lower()
@@ -681,6 +700,8 @@ class ControlPanel(QtWidgets.QMainWindow):
                     idx = -1
             if idx >= 0:
                 self.spin_ruleset.setCurrentIndex(idx)
+        if hasattr(self, "cc_think_ms"):
+            self.cc_think_ms.setValue(int(cfg.get("cc_think_ms", 150)))
         self._sync_legacy_ai_controls()
         binds = cfg.get("keybinds") or {}
         for key, edit in self.game_bind_edits.items():

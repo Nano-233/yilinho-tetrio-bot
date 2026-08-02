@@ -12,3 +12,5 @@ app_settings.json
 debug_*.png
 snapshot_bettercam.png
 cc_commit.txt
+ai_debug.log
+ai_debug_mismatch_board.*

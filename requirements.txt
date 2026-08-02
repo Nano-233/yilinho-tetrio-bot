@@ -2,6 +2,7 @@ mss
 numpy
 pillow
 pyautogui
+pydirectinput
 PythonOverlayLib
 PyQt5
 keyboard

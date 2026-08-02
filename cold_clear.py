@@ -80,12 +80,40 @@ DEFAULT_BINARY_CANDIDATES = [
     "cold-clear-2",
 ]
 
-DEFAULT_WEIGHTS = "cc_weights.json"
+_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_WEIGHTS = os.path.join(_REPO_DIR, "cc_weights.json")
+DEFAULT_THINK_TIME_SEC = 0.15
 BOARD_MISMATCH_CELLS = 0  # any vision mismatch → full TBP restart (avoid bad tree)
 
 _engine_lock = threading.Lock()
 _shared_engine: Optional["ColdClear2Engine"] = None
 _shared_engine_key = None
+
+LOG_PATH = os.path.join(_REPO_DIR, "ai_debug.log")
+
+
+def _resolve_weights_path(config_path: Optional[str]) -> str:
+    path = config_path or DEFAULT_WEIGHTS
+    if path and not os.path.isabs(path):
+        path = os.path.join(_REPO_DIR, path)
+    return path
+
+
+def reset_log():
+    try:
+        open(LOG_PATH, "w", encoding="utf-8").close()
+    except OSError:
+        pass
+
+
+def log_line(msg: str):
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def resolve_binary(path: Optional[str] = None) -> str:
@@ -161,11 +189,27 @@ def _board_mismatch(a, b) -> int:
     return int(np.sum(np.asarray(a, dtype=np.int32) != np.asarray(b, dtype=np.int32)))
 
 
+def _board_diff_summary(actual, expected, max_rows=6) -> str:
+    """Where actual/expected differ — scattered noise vs solid block offset."""
+    a = np.asarray(actual, dtype=np.int32)
+    e = np.asarray(expected, dtype=np.int32)
+    extra = np.argwhere((a == 1) & (e == 0))
+    missing = np.argwhere((a == 0) & (e == 1))
+    rows_extra = sorted({int(r) for r, _ in extra})[:max_rows]
+    rows_missing = sorted({int(r) for r, _ in missing})[:max_rows]
+    parts = []
+    if extra.size:
+        parts.append(f"+{extra.shape[0]} cells @rows{rows_extra}")
+    if missing.size:
+        parts.append(f"-{missing.shape[0]} cells @rows{rows_missing}")
+    return "; ".join(parts) if parts else "(no diff detail)"
+
+
 class ColdClear2Engine:
     def __init__(self, binary_path: Optional[str] = None, config_path: Optional[str] = None):
         binary = resolve_binary(binary_path)
         self.binary_path = binary
-        self.config_path = config_path or DEFAULT_WEIGHTS
+        self.config_path = _resolve_weights_path(config_path)
         args = [binary]
         if self.config_path and os.path.isfile(self.config_path):
             args += ["--config", self.config_path]
@@ -191,6 +235,12 @@ class ColdClear2Engine:
         self.last_move_info = None
         self._expected_board = None
         self._last_nexts = None  # next-queue snapshot after last suggest/play
+        self._last_mismatch = 0
+        self._last_actual_board = None
+        self.restart_count = 0
+        self._pending_placement = None
+        self._pending_expected_board = None
+        self._pending_nexts = None
 
     def _send(self, msg: dict):
         assert self.proc.stdin is not None
@@ -232,8 +282,10 @@ class ColdClear2Engine:
         self._expected_board = np.array(board_20_bottom_up, dtype=np.int32).copy()
         self._last_nexts = list(queue[1:])  # preview after current
 
-    def suggest(self, timeout_sec: float = 3.0) -> dict:
+    def suggest(self, timeout_sec: float = 3.0, think_time: float = DEFAULT_THINK_TIME_SEC) -> dict:
         """Ask for a move; retry while CC2 is still warming up (empty moves)."""
+        if think_time > 0:
+            time.sleep(think_time)
         deadline = time.time() + timeout_sec
         last = None
         while time.time() < deadline:
@@ -271,6 +323,9 @@ class ColdClear2Engine:
             self._active = False
         self._expected_board = None
         self._last_nexts = None
+        self._pending_placement = None
+        self._pending_expected_board = None
+        self._pending_nexts = None
 
     def quit(self):
         try:
@@ -293,7 +348,9 @@ class ColdClear2Engine:
             return False
         if self.proc.poll() is not None:
             return False
-        return _board_mismatch(board_20_bottom_up, self._expected_board) <= BOARD_MISMATCH_CELLS
+        self._last_actual_board = np.array(board_20_bottom_up, dtype=np.int32)
+        self._last_mismatch = _board_mismatch(board_20_bottom_up, self._expected_board)
+        return self._last_mismatch <= BOARD_MISMATCH_CELLS
 
 
 def get_shared_engine(binary_path=None, config_path=None) -> ColdClear2Engine:
@@ -304,7 +361,7 @@ def get_shared_engine(binary_path=None, config_path=None) -> ColdClear2Engine:
         binary = resolve_binary(binary_path)
     except FileNotFoundError:
         raise
-    weights = config_path or DEFAULT_WEIGHTS
+    weights = _resolve_weights_path(config_path)
     key = (os.path.abspath(binary), os.path.abspath(weights) if weights else None)
     with _engine_lock:
         if _shared_engine is not None and _shared_engine_key != key:
@@ -367,6 +424,7 @@ def find_best_move(
     binary_path=None,
     config_path=None,
     spin_ruleset=None,
+    think_time_sec=DEFAULT_THINK_TIME_SEC,
 ):
     """Drop-in compatible with tetris_ai.find_best_move.
 
@@ -388,22 +446,35 @@ def find_best_move(
     engine = get_shared_engine(binary_path, config_path)
     nexts = [p for p in (next_pieces or []) if p is not None]
     queue = [current_piece] + nexts
-    # CC2 steals queue[0] into hold if hold is null — fake hold=current.
-    hold_for_cc = held_piece if held_piece is not None else current_piece
+    # CC2: pass null hold when slot is empty — do not fake hold=current.
+    hold_for_cc = held_piece
 
+    was_active = engine._active
     continued = False
     if engine.can_continue(current_board):
         try:
             _sync_new_pieces(engine, nexts)
-            placement = engine.suggest()
+            placement = engine.suggest(think_time=think_time_sec)
             continued = True
+            log_line("Cold Clear continue (tree kept)")
         except Exception as e:
-            print(f"Cold Clear continue failed ({e}); restarting session", flush=True)
+            log_line(f"Cold Clear continue failed ({e}); restarting session")
             engine.stop()
 
     if not continued:
+        if was_active:
+            diff = ""
+            if engine._last_actual_board is not None and engine._expected_board is not None:
+                diff = " " + _board_diff_summary(
+                    engine._last_actual_board, engine._expected_board
+                )
+            log_line(
+                f"Cold Clear: board mismatch ({engine._last_mismatch} cells) — "
+                f"restarting session (tree discarded){diff}"
+            )
+            engine.restart_count += 1
         engine.start_game(current_board, queue, hold_for_cc, combo, b2b)
-        placement = engine.suggest()
+        placement = engine.suggest(think_time=think_time_sec)
 
     engine.last_placement = placement
     center_x, rot_index, need_hold, piece, cc_spin = placement_to_inputs(
@@ -444,19 +515,46 @@ def find_best_move(
         new_combo = combo + 1
         new_b2b = 0
 
-    # Advance CC tree optimistically so the next call can continue.
-    try:
-        engine.confirm_play(placement)
-        engine._expected_board = expected
-        engine._last_nexts = list(nexts)
-    except Exception as e:
-        print(f"Cold Clear play failed ({e}); stopping session", flush=True)
-        engine.stop()
+    # Stash for confirm after keys are sent — don't tell CC the piece landed
+    # until the bot has actually executed the placement.
+    engine._pending_placement = placement
+    engine._pending_expected_board = expected
+    engine._pending_nexts = list(nexts)
 
     info = engine.last_move_info or {}
     score = float(info.get("nodes") or 0)
 
     return score, (center_x, (rot_index,), need_hold, new_combo, new_b2b, expected)
+
+
+def cancel_pending_placement(binary_path=None, config_path=None):
+    """Drop a stashed placement when the bot decides not to execute it."""
+    engine = get_shared_engine(binary_path, config_path)
+    engine._pending_placement = None
+    engine._pending_expected_board = None
+    engine._pending_nexts = None
+
+
+def confirm_pending_placement(binary_path=None, config_path=None):
+    """Tell CC the last suggested move actually landed (call after keypresses)."""
+    engine = get_shared_engine(binary_path, config_path)
+    placement = engine._pending_placement
+    if placement is None:
+        return
+    expected = engine._pending_expected_board
+    nexts = engine._pending_nexts
+    engine._pending_placement = None
+    engine._pending_expected_board = None
+    engine._pending_nexts = None
+    try:
+        engine.confirm_play(placement)
+        if expected is not None:
+            engine._expected_board = expected
+        if nexts is not None:
+            engine._last_nexts = list(nexts)
+    except Exception as e:
+        log_line(f"Cold Clear play failed ({e}); stopping session")
+        engine.stop()
 
 
 def assert_srs_tables():

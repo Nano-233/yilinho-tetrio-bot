@@ -312,7 +312,6 @@ def cell_filled(hue, sat, val) -> bool:
 HELD_MIN_SAT = 35
 HELD_MIN_VAL = 30
 HELD_MIN_PIXELS = 4
-MAX_EMPTY_HOLD_RETRIES = 5
 QUEUE_READ_RETRIES = 6
 QUEUE_READ_DELAY = 0.025
 MAX_UNREADABLE_POLLS = 40
@@ -346,11 +345,22 @@ DEFAULT_KEYBINDS = {
 # pyautogui adds ~0.1s between actions by default — too slow for tetris
 pyautogui.PAUSE = 0
 
+try:
+    import pydirectinput as _pydirectinput
+    _USE_DIRECT_INPUT = True
+except ImportError:
+    _pydirectinput = None
+    _USE_DIRECT_INPUT = False
+
 
 def tap_key(key):
-    """Press and release a key. Works on macOS without root (needs Accessibility)."""
-    pyautogui.keyDown(key)
-    pyautogui.keyUp(key)
+    """Press and release a key. pydirectinput on Windows for browser games."""
+    if _USE_DIRECT_INPUT:
+        _pydirectinput.keyDown(key)
+        _pydirectinput.keyUp(key)
+    else:
+        pyautogui.keyDown(key)
+        pyautogui.keyUp(key)
 
 
 def monitor_containing(x, y):
@@ -738,6 +748,7 @@ class TetrioBot:
         cc_weights=None,
         play_mode="autodrop",
         spin_ruleset="all_mini_plus",
+        cc_think_ms=150,
     ):
         self.keys = dict(DEFAULT_KEYBINDS)
         if keybinds:
@@ -754,6 +765,7 @@ class TetrioBot:
             self.spin_ruleset = normalize_ruleset(spin_ruleset)
         except Exception:
             self.spin_ruleset = spin_ruleset or "all_mini_plus"
+        self.cc_think_ms = cc_think_ms or 150
         # Optional callback: publish_ghost([(col, row_top), ...], label)
         self.publish_ghost = None
         self._cc_ai_board = None  # bottom-up board at last CC decision
@@ -862,6 +874,8 @@ class TetrioBot:
             self.cc_binary = config.get("cc_binary")
         if "cc_weights" in config:
             self.cc_weights = config.get("cc_weights")
+        if "cc_think_ms" in config:
+            self.cc_think_ms = config.get("cc_think_ms") or 150
         if "spin_ruleset" in config:
             try:
                 from spin_path import normalize_ruleset
@@ -1091,7 +1105,7 @@ class TetrioBot:
         """
         from spin_path import (
             CW, CCW, ROT180, LEFT, RIGHT, SD, HD,
-            path_for_placement, would_spin, pad_board,
+            path_for_placement,
         )
 
         move_delay = lambda: get_delay_with_variance(self.move_delay_ms, self.delay_variance_percent)
@@ -1115,19 +1129,6 @@ class TetrioBot:
 
         spin = (placement or {}).get("spin", "none") or "none"
         want_spin_path = spin in ("mini", "full")
-        if not want_spin_path and placement is not None and self._cc_ai_board is not None:
-            try:
-                loc = placement["location"]
-                want_spin_path = would_spin(
-                    self.spin_ruleset,
-                    loc["type"],
-                    pad_board(self._cc_ai_board),
-                    int(loc["x"]),
-                    int(loc["y"]),
-                    loc["orientation"],
-                )
-            except Exception:
-                want_spin_path = False
 
         path = None
         if want_spin_path and placement is not None and self._cc_ai_board is not None:
@@ -1230,9 +1231,18 @@ class TetrioBot:
         combo = 0
         b2b = 0
 
+        if self.ai_engine == "cold_clear":
+            from cold_clear import reset_log, LOG_PATH
+            reset_log()
+            print(f"Cold Clear diagnostics will be written to {LOG_PATH}", flush=True)
+
         print("TetrioBot started. Waiting for game...", flush=True)
         print(f"  engine={self.ai_engine}  spin_ruleset={getattr(self, 'spin_ruleset', '?')}",
               flush=True)
+        print(
+            f"  input={'pydirectinput' if _USE_DIRECT_INPUT else 'pyautogui (install pydirectinput)'}",
+            flush=True,
+        )
         self.refresh_screen_image()
         last_next_pieces = self.read_next_pieces()
         print(f"Initial next pieces detected: {last_next_pieces}", flush=True)
@@ -1258,7 +1268,6 @@ class TetrioBot:
                 )
         expected_board = np.zeros((NUM_ROW, NUM_COL), dtype=np.int32)
         poll_count = 0
-        empty_hold_retries = 0
         unreadable = 0
         while not self._stop:
             next_pieces = self.read_next_pieces()
@@ -1323,26 +1332,12 @@ class TetrioBot:
                 expected_board = raw_board.copy()
 
             held_piece = self.read_held_piece()
-            if held_piece is None:
-                if self.last_held_piece is None:
-                    empty_hold_retries += 1
-                    print(f"Hold empty — pressing hold to fill slot "
-                          f"(attempt {empty_hold_retries})", flush=True)
-                    if empty_hold_retries >= MAX_EMPTY_HOLD_RETRIES:
-                        print("Giving up on hold detection. Check held_piece_xy "
-                              "with --test; aim at the coloured blocks.", flush=True)
-                        return
-                    tap_key(self.keys["hold"])
-                    self.hold_used_this_piece = True
-                    time.sleep(get_delay_with_variance(
-                        self.action_delay_ms, self.delay_variance_percent) + 0.15)
-                    last_next_pieces = self.read_next_pieces()
-                    continue
+            # Empty hold at game start is normal — CC treats hold=null correctly.
+            # Do NOT auto-press hold here; that skipped the first real cycles.
+            if held_piece is None and self.last_held_piece is not None:
                 # Hold was used this cycle; slot looks empty but AI still
                 # needs a label — use current piece (hold == current → no swap).
                 held_piece = current_piece
-            else:
-                empty_hold_retries = 0
 
             t1 = time.time()
             # Screen scan uses row 0 = top; AI engines use row 0 = bottom.
@@ -1358,6 +1353,7 @@ class TetrioBot:
                     binary_path=self.cc_binary,
                     config_path=self.cc_weights,
                     spin_ruleset=self.spin_ruleset,
+                    think_time_sec=(self.cc_think_ms or 0) / 1000.0,
                 )
             else:
                 score, (position, rotations, need_hold, combo, b2b, ai_expected) = find_best_move_legacy(
@@ -1485,6 +1481,9 @@ class TetrioBot:
                 cur = self.read_next_pieces()
                 if decision_queue is not None and cur != decision_queue:
                     # User placed; sync to new queue and skip our keypresses
+                    if self.ai_engine == "cold_clear":
+                        from cold_clear import cancel_pending_placement
+                        cancel_pending_placement(self.cc_binary, self.cc_weights)
                     last_next_pieces = cur
                     self._clear_ghost()
                     break
@@ -1493,6 +1492,10 @@ class TetrioBot:
                 if self._stop:
                     break
                 continue
+
+            if self.ai_engine == "cold_clear":
+                from cold_clear import confirm_pending_placement
+                confirm_pending_placement(self.cc_binary, self.cc_weights)
 
             self._clear_ghost()
             if need_hold:
@@ -1549,6 +1552,7 @@ def bot_from_config(config, debug=False, pause_sec=0):
         cc_weights=config.get("cc_weights"),
         play_mode=config.get("play_mode", "autodrop"),
         spin_ruleset=config.get("spin_ruleset", "all_mini_plus"),
+        cc_think_ms=config.get("cc_think_ms", 150),
     )
 
 
@@ -1687,6 +1691,7 @@ def main():
             cc_binary=config.get('cc_binary'),
             cc_weights=config.get('cc_weights'),
             spin_ruleset=args.spin_ruleset or config.get('spin_ruleset', 'all_mini_plus'),
+            cc_think_ms=config.get('cc_think_ms', 150),
         )
     else:
         # Use default/hardcoded values
@@ -1718,6 +1723,7 @@ def main():
             pause_sec=args.pause,
             ai_engine=args.ai_engine or 'legacy',
             spin_ruleset=args.spin_ruleset or 'all_mini_plus',
+            cc_think_ms=150,
         )
 
     if args.pause > 0:
