@@ -316,7 +316,7 @@ QUEUE_READ_RETRIES = 6
 QUEUE_READ_DELAY = 0.025
 MAX_UNREADABLE_POLLS = 40
 SPAWN_MASK_ROWS = 4       # top rows — active piece lives here, hide from AI
-LOCK_SETTLE_SEC = 0.05    # wait after hard drop before next read
+LOCK_SETTLE_SEC = 0.02    # brief post-drop before vision (only when verifying)
 BOARD_STABLE_TRIES = 4
 BOARD_STABLE_GAP = 0.025
 SPAWN_COLUMN = 3          # default piece spawn column for movement math (legacy left-edge)
@@ -357,8 +357,9 @@ except ImportError:
     _USE_DIRECT_INPUT = False
 
 
+# Instant tap (down/up). Placement gaps come from move/action delay, not hold.
 def tap_key(key, hold_sec=0.0):
-    """Press and release a key. pydirectinput on Windows for browser games."""
+    """Press and release a key. pydirectinput on Windows for browser/desktop."""
     if _USE_DIRECT_INPUT:
         _pydirectinput.keyDown(key)
         if hold_sec > 0:
@@ -727,8 +728,8 @@ def run_calibration_wizard(config_path=CONFIG_FILE):
 wait_time = 0.01
 # SDF max/inf: brief hold is enough to sonic; too short and Electron drops the key.
 soft_drop_delay = 0.08
-# Extra wait after line clears — TETR.IO animates; mid-clear vision desyncs CC.
-CLEAR_SETTLE_SEC = 0.12
+# Extra wait after line clears — only when vision-verifying mid-animation.
+CLEAR_SETTLE_SEC = 0.08
 # Game Settings tip: ARR 0, DAS ~100–150ms ok (bot taps), SDF max/inf, DCD 0
 
 
@@ -1004,26 +1005,85 @@ class TetrioBot:
         return held
 
     def board_looks_obscured(self, board_image_L=None) -> bool:
-        """True if a bright overlay (e.g. OUT OF FOCUS) covers mid-board.
+        """True if a bright grey/white overlay (OUT OF FOCUS) covers mid-board.
 
-        Uses a majority vote, not an average: thin yellow calib grid lines can
-        sit on a sample pixel and inflate the mean without covering the field.
+        Must NOT treat colored stack minos as obscured — those are bright but
+        saturated. The focus banner is bright and nearly grey.
         """
-        if board_image_L is None:
-            board_image_L = self.screen_image.crop((
-                self.board_top_left[0],
-                self.board_top_left[1],
-                self.board_bottom_right[0],
-                self.board_bottom_right[1],
-            )).convert("L")
-        w, h = board_image_L.size
-        # Sample a horizontal band through mid-board (where the banner sits)
+        board_rgb = self.screen_image.crop((
+            self.board_top_left[0],
+            self.board_top_left[1],
+            self.board_bottom_right[0],
+            self.board_bottom_right[1],
+        )).convert("RGB")
+        board_hsv = board_rgb.convert("HSV")
+        w, h = board_rgb.size
         ys = (h // 2 - h // 20, h // 2, h // 2 + h // 20)
         xs = (w // 4, w // 2, 3 * w // 4)
-        vals = [board_image_L.getpixel((x, y)) for y in ys for x in xs]
-        # Empty playfield is near-black; OUT OF FOCUS banner lights most samples.
-        bright = sum(1 for v in vals if v > 120)
-        return bright >= 6
+        # PIL HSV: S/V are 0–255. Banner ≈ high V, low S; pieces ≈ high V, high S.
+        grey_bright = 0
+        vals = []
+        for y in ys:
+            for x in xs:
+                _h, s, v = board_hsv.getpixel((x, y))
+                vals.append(v)
+                if v > 120 and s < 50:
+                    grey_bright += 1
+        self._last_obscured_vals = vals
+        return grey_bright >= 6
+
+    def _dump_obscured_debug(self, path="debug_obscured.png"):
+        """Save what capture sees + the 9 mid-board samples that tripped obscured.
+
+        Overlay can look fine while bettercam/mss grabs a different monitor or
+        a bright crop — this file is the ground truth the check uses.
+        """
+        try:
+            self.refresh_screen_image()
+            full = self.screen_image.copy()
+            left, top = self.board_top_left
+            right, bottom = self.board_bottom_right
+            board = full.crop((left, top, right, bottom))
+            board_hsv = board.convert("HSV")
+            w, h = board.size
+            ys = (h // 2 - h // 20, h // 2, h // 2 + h // 20)
+            xs = (w // 4, w // 2, 3 * w // 4)
+            vals = []
+            board_rgb = board.convert("RGB")
+            draw_b = ImageDraw.Draw(board_rgb)
+            for y in ys:
+                for x in xs:
+                    _h, s, v = board_hsv.getpixel((x, y))
+                    vals.append(v)
+                    # Match the real check: bright + desaturated = trip
+                    trip = v > 120 and s < 50
+                    color = (255, 40, 40) if trip else (40, 255, 40)
+                    draw_b.ellipse([x - 4, y - 4, x + 4, y + 4], outline=color, width=2)
+                    draw_b.text((x + 6, y - 6), f"{v}/{s}", fill=color)
+
+            ann = full.copy()
+            draw = ImageDraw.Draw(ann)
+            draw.rectangle([left, top, right, bottom], outline=(255, 255, 0), width=3)
+            board_rgb.save(path)
+            full_path = path.replace(".png", "_full.png")
+            max_w = 1280
+            if ann.width > max_w:
+                ratio = max_w / ann.width
+                ann = ann.resize((max_w, int(ann.height * ratio)))
+            ann.save(full_path)
+            trips = sum(1 for y in ys for x in xs
+                        if (lambda p: p[2] > 120 and p[1] < 50)(board_hsv.getpixel((x, y))))
+            print(
+                f"  obscured debug: V/S labeled on dots, grey-bright trips={trips}/9 "
+                f"→ saved {path} + {full_path}",
+                flush=True,
+            )
+            print(
+                "  red = bright+grey (banner). green = empty or colored stack (OK).",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"  obscured debug save failed: {e}", flush=True)
 
     def get_tetris_board(self):
         """Read filled cells from a 3x3 sample per cell (row 0 = top).
@@ -1273,8 +1333,7 @@ class TetrioBot:
             path_ok,
         )
 
-        # No variance on place taps — ±20% occasionally dropped inputs (~1/20).
-        # Floor is ~1 frame only; config move/action delays apply above that.
+        # Web-stable placement taps: 16ms floor, instant down/up, no variance.
         move_delay = lambda: input_gap_sec_stable(self.move_delay_ms, floor_ms=16)
         action_delay = lambda: input_gap_sec_stable(self.action_delay_ms, floor_ms=16)
         tuck_gap = max(MIN_INPUT_GAP_SEC, 0.016)
@@ -1303,7 +1362,6 @@ class TetrioBot:
                 pass
 
         if need_hold:
-            # Shift needs a slightly longer down pulse on some setups
             tap_key(self.keys["hold"], hold_sec=0.04)
             if not self._sleep(max(action_delay(), 0.05)):
                 return False
@@ -1508,6 +1566,12 @@ class TetrioBot:
                         "Board looks obscured (window unfocused / covered?) — waiting.",
                         flush=True,
                     )
+                    # Rate-limit dumps: first hit + every ~3s while stuck
+                    now = time.time()
+                    last = getattr(self, "_last_obscured_dump", 0.0)
+                    if now - last > 3.0:
+                        self._last_obscured_dump = now
+                        self._dump_obscured_debug()
                     time.sleep(0.25)
                     self.refresh_screen_image()
                     # Restore pre-shift queue so we retry this piece instead of
@@ -1788,49 +1852,63 @@ class TetrioBot:
                 self._board_trusted = False
                 continue
 
+            # Trust path (web-stable): confirm without waiting out clear flash.
+            # Next-loop peek still catches garbage / real misses.
+            board_already_stable = False
             if self.ai_engine == "cold_clear":
-                # Ghost off before capture — cyan fill would corrupt the check.
-                self._clear_ghost()
-                time.sleep(0.02)
-                matched, actual_m, exp_m = self._board_matches_expected(
-                    expected_board, quick=(mode == "autodrop")
-                )
-                if matched:
+                if (
+                    self.trust_expected_board
+                    and mode == "autodrop"
+                    and placed
+                ):
                     from cold_clear import confirm_pending_placement
                     confirm_pending_placement(self.cc_binary, self.cc_weights)
                     self._board_trusted = True
+                    board_already_stable = True
+                    self._clear_ghost()
                 else:
-                    from cold_clear import cancel_pending_placement, _board_diff_summary
-                    cancel_pending_placement(self.cc_binary, self.cc_weights)
-                    self._board_trusted = False
-                    try:
-                        detail = _board_diff_summary(
-                            np.flipud(actual_m), np.flipud(exp_m)
-                        )
-                    except Exception:
-                        detail = "mismatch"
-                    print(
-                        f"  AUTODROP MISS vs ghost — not confirming CC ({detail})",
-                        flush=True,
+                    self._clear_ghost()
+                    matched, actual_m, exp_m = self._board_matches_expected(
+                        expected_board, quick=(mode == "autodrop")
                     )
+                    if matched:
+                        from cold_clear import confirm_pending_placement
+                        confirm_pending_placement(self.cc_binary, self.cc_weights)
+                        self._board_trusted = True
+                        board_already_stable = True
+                    else:
+                        from cold_clear import cancel_pending_placement, _board_diff_summary
+                        cancel_pending_placement(self.cc_binary, self.cc_weights)
+                        self._board_trusted = False
+                        try:
+                            detail = _board_diff_summary(
+                                np.flipud(actual_m), np.flipud(exp_m)
+                            )
+                        except Exception:
+                            detail = "mismatch"
+                        print(
+                            f"  AUTODROP MISS vs ghost — not confirming CC ({detail})",
+                            flush=True,
+                        )
             else:
                 self._board_trusted = True
+                board_already_stable = True
                 self._clear_ghost()
 
             self._clear_ghost()
             if need_hold:
                 self.hold_used_this_piece = True
                 self.last_held_piece = falling_piece
-            # Short settle only for autodrop key timing / clear anim before next
-            # queue poll — not for re-reading the board when trusted.
-            settle = LOCK_SETTLE_SEC
-            if self.play_mode == "autodrop":
-                settle += get_delay_with_variance(
-                    self.action_delay_ms, self.delay_variance_percent
-                )
-            if int(expected_board.sum()) < int(current_board.sum()):
-                settle += CLEAR_SETTLE_SEC
-            time.sleep(settle)
+            if board_already_stable:
+                settle = 0
+            else:
+                settle = LOCK_SETTLE_SEC
+                if self.play_mode == "autodrop":
+                    settle += input_gap_sec_stable(self.action_delay_ms, floor_ms=16)
+                if int(expected_board.sum()) < int(current_board.sum()):
+                    settle += CLEAR_SETTLE_SEC
+            if settle > 0:
+                time.sleep(settle)
         print("TetrioBot stopped.", flush=True)
         self._clear_ghost()
 

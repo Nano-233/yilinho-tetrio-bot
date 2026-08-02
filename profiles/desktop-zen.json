@@ -1,0 +1,54 @@
+{
+  "label": "desktop-zen",
+  "screen_offset": [
+    0,
+    0
+  ],
+  "screen_resolution": [
+    2560,
+    1600
+  ],
+  "board_top_left": [
+    1049,
+    318
+  ],
+  "board_bottom_right": [
+    1512,
+    1245
+  ],
+  "next_piece_xy_0": [
+    1631,
+    434
+  ],
+  "next_piece_xy_4": [
+    1632,
+    989
+  ],
+  "held_piece_xy": [
+    930,
+    429
+  ],
+  "move_delay_ms": 16,
+  "action_delay_ms": 16,
+  "delay_variance_percent": 20,
+  "keybinds": {
+    "move_left": "a",
+    "move_right": "d",
+    "soft_drop": "w",
+    "hard_drop": "s",
+    "rotate_cw": "right",
+    "rotate_ccw": "left",
+    "rotate_180": "up",
+    "hold": "shiftleft"
+  },
+  "mp": 16,
+  "pruning_moves": 5,
+  "pruning_breadth": 5,
+  "ai_engine": "cold_clear",
+  "spin_ruleset": "all_mini_plus",
+  "play_mode": "autodrop",
+  "cc_think_ms": 0,
+  "trust_expected_board": true,
+  "simple_placements": false,
+  "show_autodrop_ghost": true
+}
