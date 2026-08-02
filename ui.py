@@ -4,6 +4,7 @@ Entry: python ui.py
 """
 from __future__ import annotations
 
+import ctypes
 import importlib
 import math
 import sys
@@ -83,6 +84,40 @@ APP_HOTKEY_LABELS = [
     ("toggle_overlay", "Toggle overlay"),
     ("toggle_play_mode", "Toggle autodrop/suggest"),
 ]
+
+# Global hotkeys via GetAsyncKeyState poll — sees keys while TETR.IO is focused
+# without RegisterHotKey (which consumes/disables the key system-wide).
+_HOTKEY_ACTIONS = (
+    "start_bot",
+    "stop_bot",
+    "toggle_overlay",
+    "toggle_play_mode",
+)
+
+
+def _vk_from_hotkey_name(name: str):
+    """Map a hotkey field value ('p', 'f8', 'space') to a Win32 virtual-key code."""
+    n = (name or "").strip().lower()
+    if not n:
+        return None
+    if len(n) == 1 and "a" <= n <= "z":
+        return ord(n.upper())
+    if len(n) == 1 and "0" <= n <= "9":
+        return ord(n)
+    if n.startswith("f") and n[1:].isdigit():
+        i = int(n[1:])
+        if 1 <= i <= 24:
+            return 0x70 + (i - 1)
+    named = {
+        "space": 0x20,
+        "tab": 0x09,
+        "esc": 0x1B,
+        "escape": 0x1B,
+        "enter": 0x0D,
+        "return": 0x0D,
+    }
+    return named.get(n)
+
 
 CALIB_FIELDS = [
     ("board_top_left", "Board top-left"),
@@ -181,10 +216,11 @@ def _force_topmost(win):
         HWND_TOPMOST = -1
         SWP_NOMOVE = 0x0002
         SWP_NOSIZE = 0x0001
-        SWP_SHOWWINDOW = 0x0040
+        SWP_NOACTIVATE = 0x0010
+        # NOACTIVATE: SWP_SHOWWINDOW alone steals focus from Electron mid-path.
         ctypes.windll.user32.SetWindowPos(
             hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         )
     except Exception as e:
         print(f"overlay SetWindowPos failed: {e}", flush=True)
@@ -450,7 +486,8 @@ class ControlPanel(QtWidgets.QMainWindow):
         self._capturing = False
         self._capture_field = None
         self._countdown = 0
-        self._hotkey_hooks = []
+        self._hotkey_vks = {}  # action -> vk
+        self._hotkey_prev_down = {}  # action -> bool (edge detect)
 
         self.hotkey_start.connect(self.start_bot)
         self.hotkey_stop.connect(self.stop_bot)
@@ -459,7 +496,6 @@ class ControlPanel(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._load_profile_into_form(self.profile_name)
-        self._register_hotkeys()
 
         self._capture_timer = QtCore.QTimer(self)
         self._capture_timer.setInterval(1000)
@@ -471,6 +507,11 @@ class ControlPanel(QtWidgets.QMainWindow):
         self._ghost_timer.timeout.connect(self._ensure_ghost_window)
         self._ghost_timer.start()
 
+        # Global hotkey poll (~60Hz). Does not swallow keys from other apps.
+        self._hotkey_timer = QtCore.QTimer(self)
+        self._hotkey_timer.setInterval(16)
+        self._hotkey_timer.timeout.connect(self._poll_hotkeys)
+
         QtCore.QTimer.singleShot(0, self._after_show)
 
     def _after_show(self):
@@ -480,6 +521,7 @@ class ControlPanel(QtWidgets.QMainWindow):
         win = _STATE.get("overlay_win")
         if win is not None and not _STATE["overlay_enabled"]:
             win.hide()
+        self._register_hotkeys()
 
     def _build_ui(self):
         root = QtWidgets.QWidget()
@@ -654,6 +696,24 @@ class ControlPanel(QtWidgets.QMainWindow):
             "Ghost is cleared before any board read so it does not pollute vision."
         )
         form.addRow("", self.show_autodrop_ghost)
+        self.client_mode = QtWidgets.QComboBox()
+        self.client_mode.addItem("Web (browser)", "web")
+        self.client_mode.addItem("Desktop (Electron)", "desktop")
+        self.client_mode.setToolTip(
+            "Desktop uses longer taps / gaps (Electron drops short keys,\n"
+            "especially uncapped FPS). Arrow rotates are NumLock-safe."
+        )
+        form.addRow("TETR.IO client", self.client_mode)
+        self.vision_confirm = QtWidgets.QCheckBox(
+            "Vision-confirm before CC (slower; catches missed taps)"
+        )
+        self.vision_confirm.setChecked(False)
+        self.vision_confirm.setToolTip(
+            "After each drop, re-read the board and only confirm Cold Clear if it "
+            "matches the ghost. Costs ~20–80ms per piece. Off = trust-confirm "
+            "(fast; next peek still catches garbage/desync)."
+        )
+        form.addRow("", self.vision_confirm)
         self.ai_legacy.toggled.connect(self._sync_legacy_ai_controls)
         self.ai_cc.toggled.connect(self._sync_legacy_ai_controls)
         self._legacy_ai_widgets = (self.mp, self.pruning_moves, self.pruning_breadth)
@@ -671,11 +731,15 @@ class ControlPanel(QtWidgets.QMainWindow):
             self.game_bind_edits[key] = edit
             gform.addRow(label, edit)
         keys_l.addLayout(gform)
-        keys_l.addWidget(QtWidgets.QLabel("App hotkeys (global)"))
+        keys_l.addWidget(QtWidgets.QLabel(
+            "App hotkeys (global, pass-through — still type into TETR.IO)"
+        ))
         self.app_hotkey_edits = {}
         aform = QtWidgets.QFormLayout()
         for key, label in APP_HOTKEY_LABELS:
             edit = QtWidgets.QLineEdit()
+            edit.setPlaceholderText(DEFAULT_APP_HOTKEYS[key])
+            edit.editingFinished.connect(self._on_hotkeys_edited)
             self.app_hotkey_edits[key] = edit
             aform.addRow(label, edit)
         keys_l.addLayout(aform)
@@ -769,6 +833,10 @@ class ControlPanel(QtWidgets.QMainWindow):
             cfg["simple_placements"] = self.simple_placements.isChecked()
         if hasattr(self, "show_autodrop_ghost"):
             cfg["show_autodrop_ghost"] = self.show_autodrop_ghost.isChecked()
+        if hasattr(self, "client_mode"):
+            cfg["client_mode"] = self.client_mode.currentData() or "web"
+        if hasattr(self, "vision_confirm"):
+            cfg["vision_confirm"] = self.vision_confirm.isChecked()
         binds = dict(DEFAULT_KEYBINDS)
         for key, edit in self.game_bind_edits.items():
             val = edit.text().strip().lower()
@@ -787,6 +855,12 @@ class ControlPanel(QtWidgets.QMainWindow):
             val = edit.text().strip().lower()
             hotkeys[key] = val or DEFAULT_APP_HOTKEYS[key]
         return hotkeys
+
+    def _on_hotkeys_edited(self):
+        """Re-bind immediately when a hotkey field loses focus (no Save needed)."""
+        self.settings["hotkeys"] = self._collect_app_hotkeys()
+        save_app_settings(self.settings)
+        self._register_hotkeys()
 
     def _load_profile_into_form(self, name):
         cfg = load_profile(name)
@@ -846,6 +920,15 @@ class ControlPanel(QtWidgets.QMainWindow):
             self.show_autodrop_ghost.setChecked(
                 bool(cfg.get("show_autodrop_ghost", True))
             )
+        if hasattr(self, "client_mode"):
+            mode = str(cfg.get("client_mode") or "web").lower()
+            idx = self.client_mode.findData(
+                "desktop" if mode == "desktop" else "web"
+            )
+            if idx >= 0:
+                self.client_mode.setCurrentIndex(idx)
+        if hasattr(self, "vision_confirm"):
+            self.vision_confirm.setChecked(bool(cfg.get("vision_confirm", False)))
         self._sync_legacy_ai_controls()
         binds = cfg.get("keybinds") or {}
         for key, edit in self.game_bind_edits.items():
@@ -968,19 +1051,21 @@ class ControlPanel(QtWidgets.QMainWindow):
             win.show()
 
     def toggle_overlay(self):
-        self._set_overlay(not _STATE["overlay_enabled"])
+        on = not _STATE["overlay_enabled"]
+        self._set_overlay(on)
+        self._toast(f"Overlay {'ON' if on else 'OFF'}")
 
     def _on_play_mode_radio(self, checked):
         if not checked:
             return
         mode = "suggest" if self.mode_suggest.isChecked() else "autodrop"
-        self._set_play_mode(mode)
+        self._set_play_mode(mode, toast=False)
 
     def toggle_play_mode(self):
         mode = "autodrop" if _STATE.get("play_mode") == "suggest" else "suggest"
-        self._set_play_mode(mode)
+        self._set_play_mode(mode, toast=True)
 
-    def _set_play_mode(self, mode):
+    def _set_play_mode(self, mode, *, toast=False):
         mode = "suggest" if mode == "suggest" else "autodrop"
         _STATE["play_mode"] = mode
         self.settings["play_mode"] = mode
@@ -1004,10 +1089,15 @@ class ControlPanel(QtWidgets.QMainWindow):
                     win.hide()
         self.mode_autodrop.blockSignals(False)
         self.mode_suggest.blockSignals(False)
+        if toast:
+            self._toast(f"Mode: {mode.upper()}")
         if self.worker is not None:
             self.worker.set_play_mode(mode)
         print(f"Play mode set: {mode}", flush=True)
-        self._set_status(f"Play mode: {mode}")
+        if self._is_running():
+            self._set_status(f"Running ({mode})")
+        else:
+            self._set_status(f"Play mode: {mode}")
 
     # --- Calibration capture ---
     def _begin_capture(self, field_key):
@@ -1070,6 +1160,44 @@ class ControlPanel(QtWidgets.QMainWindow):
             f"{warn}"
         )
 
+    # --- Toast ---
+    def _toast(self, text, ms=1400):
+        """Brief topmost popup — confirms hotkey toggles without stealing focus."""
+        label = getattr(self, "_toast_label", None)
+        if label is None:
+            label = QtWidgets.QLabel()
+            label.setWindowFlags(
+                QtCore.Qt.Tool
+                | QtCore.Qt.FramelessWindowHint
+                | QtCore.Qt.WindowStaysOnTopHint
+                | QtCore.Qt.WindowDoesNotAcceptFocus
+            )
+            label.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+            label.setStyleSheet(
+                "QLabel {"
+                "  background: rgba(18, 18, 22, 210);"
+                "  color: #f2f2f2;"
+                "  padding: 10px 18px;"
+                "  border-radius: 8px;"
+                "  font-size: 15px;"
+                "  font-weight: 600;"
+                "}"
+            )
+            self._toast_label = label
+            self._toast_timer = QtCore.QTimer(self)
+            self._toast_timer.setSingleShot(True)
+            self._toast_timer.timeout.connect(label.hide)
+        label.setText(text)
+        label.adjustSize()
+        # Near top-center of the control panel's screen
+        screen = QtWidgets.QApplication.desktop().screenGeometry(self)
+        x = screen.x() + (screen.width() - label.width()) // 2
+        y = screen.y() + 48
+        label.move(x, y)
+        label.show()
+        label.raise_()
+        self._toast_timer.start(ms)
+
     # --- Bot run ---
     def start_bot(self):
         if self._is_running() or self._capturing:
@@ -1099,14 +1227,18 @@ class ControlPanel(QtWidgets.QMainWindow):
             self._set_status(f"Running ({mode})")
         else:
             self._set_status(f"Running ({mode})")
+        self._toast(f"Bot START ({mode})")
         self.worker.start()
 
     def stop_bot(self):
-        if self.worker is not None:
-            self.worker.request_stop()
-            self._set_status("Stopping…")
-            # If cooperative stop wedges inside a long place/CC call, force-quit.
-            QtCore.QTimer.singleShot(1500, self._force_stop_bot)
+        if self.worker is None:
+            self._toast("Bot already stopped")
+            return
+        self.worker.request_stop()
+        self._set_status("Stopping…")
+        self._toast("Bot STOP")
+        # If cooperative stop wedges inside a long place/CC call, force-quit.
+        QtCore.QTimer.singleShot(1500, self._force_stop_bot)
 
     def _force_stop_bot(self):
         w = self.worker
@@ -1135,42 +1267,94 @@ class ControlPanel(QtWidgets.QMainWindow):
     def _on_bot_error(self, msg):
         QtWidgets.QMessageBox.critical(self, "Bot error", msg)
 
-    # --- Global hotkeys ---
+    # --- Global hotkeys (poll — does not swallow keys) ---
+    def _hotkey_typing_in_form(self):
+        """Ignore global hotkeys while editing a field in this panel."""
+        w = QtWidgets.QApplication.focusWidget()
+        if w is None:
+            return False
+        panel = w
+        while panel is not None:
+            if panel is self:
+                return isinstance(
+                    w,
+                    (
+                        QtWidgets.QLineEdit,
+                        QtWidgets.QSpinBox,
+                        QtWidgets.QComboBox,
+                        QtWidgets.QPlainTextEdit,
+                        QtWidgets.QTextEdit,
+                    ),
+                )
+            panel = panel.parentWidget()
+        return False
+
+    def _fire_hotkey_action(self, action: str):
+        if action == "start_bot":
+            self.hotkey_start.emit()
+        elif action == "stop_bot":
+            self.hotkey_stop.emit()
+        elif action == "toggle_overlay":
+            self.hotkey_overlay.emit()
+        elif action == "toggle_play_mode":
+            self.hotkey_play_mode.emit()
+
+    def _poll_hotkeys(self):
+        """Rising-edge detect bound keys via GetAsyncKeyState (pass-through)."""
+        if sys.platform != "win32" or not self._hotkey_vks:
+            return
+        if self._hotkey_typing_in_form():
+            # While typing in the panel, treat keys as held so release→press
+            # after leaving the field doesn't immediately fire.
+            for action in self._hotkey_vks:
+                self._hotkey_prev_down[action] = True
+            return
+        user32 = ctypes.windll.user32
+        for action, vk in self._hotkey_vks.items():
+            down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+            prev = self._hotkey_prev_down.get(action, False)
+            if down and not prev:
+                self._fire_hotkey_action(action)
+            self._hotkey_prev_down[action] = down
+
     def _clear_hotkeys(self):
-        try:
-            import keyboard
-            for h in self._hotkey_hooks:
-                try:
-                    keyboard.remove_hotkey(h)
-                except Exception:
-                    pass
-        except ImportError:
-            pass
-        self._hotkey_hooks = []
+        if hasattr(self, "_hotkey_timer"):
+            self._hotkey_timer.stop()
+        self._hotkey_vks = {}
+        self._hotkey_prev_down = {}
 
     def _register_hotkeys(self):
+        """Bind global hotkeys without consuming them (keys still reach TETR.IO)."""
         self._clear_hotkeys()
-        try:
-            import keyboard
-        except ImportError:
-            self._set_status("Idle (install keyboard for global hotkeys)")
+        if sys.platform != "win32":
+            self._set_status("Idle (global hotkeys are Windows-only)")
             return
-        hotkeys = self._collect_app_hotkeys()
-        mapping = {
-            "start_bot": lambda: self.hotkey_start.emit(),
-            "stop_bot": lambda: self.hotkey_stop.emit(),
-            "toggle_overlay": lambda: self.hotkey_overlay.emit(),
-            "toggle_play_mode": lambda: self.hotkey_play_mode.emit(),
-        }
-        for action, key in hotkeys.items():
-            cb = mapping.get(action)
-            if not cb or not key:
+
+        hotkeys = dict(DEFAULT_APP_HOTKEYS)
+        hotkeys.update(self.settings.get("hotkeys") or {})
+        hotkeys.update(self._collect_app_hotkeys())
+
+        bound = []
+        for action in _HOTKEY_ACTIONS:
+            key = hotkeys.get(action) or DEFAULT_APP_HOTKEYS.get(action)
+            vk = _vk_from_hotkey_name(key)
+            if vk is None:
+                print(f"Hotkey '{key}' for {action}: unknown key name", flush=True)
                 continue
-            try:
-                handle = keyboard.add_hotkey(key, cb, suppress=False)
-                self._hotkey_hooks.append(handle)
-            except Exception as e:
-                print(f"Hotkey '{key}' for {action} failed: {e}", flush=True)
+            self._hotkey_vks[action] = vk
+            # Seed "down" if already held so we don't fire on register.
+            held = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+            self._hotkey_prev_down[action] = held
+            bound.append(f"{action.split('_')[0]}={key}")
+
+        if bound:
+            self._hotkey_timer.start()
+            msg = f"Global hotkeys (pass-through): {' · '.join(bound)}"
+            print(msg, flush=True)
+            if not self._is_running():
+                self._set_status(msg)
+        else:
+            print("Global hotkeys: none registered", flush=True)
 
     def closeEvent(self, event):
         if self._is_running():

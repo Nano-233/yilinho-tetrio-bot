@@ -19,10 +19,10 @@ APP_SETTINGS_FILE = "app_settings.json"
 DEFAULT_PROFILE_NAME = "default"
 
 DEFAULT_APP_HOTKEYS = {
-    "start_bot": "f6",
-    "stop_bot": "f7",
-    "toggle_overlay": "f8",
-    "toggle_play_mode": "f9",
+    "start_bot": "p",
+    "stop_bot": "o",
+    "toggle_overlay": "l",
+    "toggle_play_mode": "k",
 }
 
 DEFAULT_AI = {
@@ -35,6 +35,8 @@ DEFAULT_AI = {
     "trust_expected_board": True,
     "simple_placements": False,
     "show_autodrop_ghost": True,
+    "client_mode": "web",  # "web" | "desktop"
+    "vision_confirm": False,
 }
 
 
@@ -65,6 +67,9 @@ def normalize_profile(config):
     config.setdefault("trust_expected_board", DEFAULT_AI["trust_expected_board"])
     config.setdefault("simple_placements", DEFAULT_AI["simple_placements"])
     config.setdefault("show_autodrop_ghost", DEFAULT_AI["show_autodrop_ghost"])
+    mode = str(config.get("client_mode") or DEFAULT_AI["client_mode"]).lower()
+    config["client_mode"] = "desktop" if mode == "desktop" else "web"
+    config.setdefault("vision_confirm", DEFAULT_AI["vision_confirm"])
     binds = dict(DEFAULT_KEYBINDS)
     binds.update(config.get("keybinds") or {})
     config["keybinds"] = binds

@@ -50,5 +50,7 @@
   "cc_think_ms": 0,
   "trust_expected_board": true,
   "simple_placements": false,
-  "show_autodrop_ghost": true
+  "show_autodrop_ghost": true,
+  "client_mode": "desktop",
+  "vision_confirm": true
 }

@@ -241,6 +241,9 @@ class ColdClear2Engine:
         self._pending_placement = None
         self._pending_expected_board = None
         self._pending_nexts = None
+        self._pending_falling = None
+        self._pending_hold_before = None
+        self._cc_hold = None  # mirror of CC hold after last confirmed play
 
     def _send(self, msg: dict):
         assert self.proc.stdin is not None
@@ -281,6 +284,12 @@ class ColdClear2Engine:
         self._active = True
         self._expected_board = np.array(board_20_bottom_up, dtype=np.int32).copy()
         self._last_nexts = list(queue[1:])  # preview after current
+        self._cc_hold = hold if hold else None
+        self._pending_placement = None
+        self._pending_expected_board = None
+        self._pending_nexts = None
+        self._pending_falling = None
+        self._pending_hold_before = None
 
     def suggest(self, timeout_sec: float = 3.0, think_time: float = DEFAULT_THINK_TIME_SEC) -> dict:
         """Ask for a move; retry while CC2 is still warming up (empty moves)."""
@@ -326,6 +335,9 @@ class ColdClear2Engine:
         self._pending_placement = None
         self._pending_expected_board = None
         self._pending_nexts = None
+        self._pending_falling = None
+        self._pending_hold_before = None
+        self._cc_hold = None
 
     def quit(self):
         try:
@@ -451,6 +463,19 @@ def find_best_move(
 
     was_active = engine._active
     continued = False
+    vision_hold = held_piece if held_piece else None
+    cc_hold = getattr(engine, "_cc_hold", None)
+    hold_desync = (
+        engine._active
+        and (vision_hold or None) != (cc_hold or None)
+    )
+    if hold_desync:
+        log_line(
+            f"Cold Clear hold desync vision={vision_hold} cc={cc_hold} — restarting"
+        )
+        engine.stop()
+        was_active = False
+
     if engine.can_continue(current_board):
         try:
             _sync_new_pieces(engine, nexts)
@@ -480,6 +505,21 @@ def find_best_move(
     center_x, rot_index, need_hold, piece, cc_spin = placement_to_inputs(
         placement, current_piece
     )
+    # After hold, the piece we actually drop must match CC's placement type.
+    if need_hold:
+        will_place = hold_for_cc if hold_for_cc else (nexts[0] if nexts else None)
+        if will_place and will_place != piece:
+            log_line(
+                f"Cold Clear place piece mismatch: CC={piece} after-hold={will_place} "
+                f"(falling={current_piece}) — restarting"
+            )
+            engine.stop()
+            engine.start_game(current_board, queue, hold_for_cc, combo, b2b)
+            placement = engine.suggest(think_time=think_time_sec)
+            engine.last_placement = placement
+            center_x, rot_index, need_hold, piece, cc_spin = placement_to_inputs(
+                placement, current_piece
+            )
     expected = apply_placement_board(current_board, placement)
     cleared = cleared_lines_after(current_board, placement)
 
@@ -520,6 +560,8 @@ def find_best_move(
     engine._pending_placement = placement
     engine._pending_expected_board = expected
     engine._pending_nexts = list(nexts)
+    engine._pending_falling = current_piece
+    engine._pending_hold_before = hold_for_cc if hold_for_cc else None
 
     info = engine.last_move_info or {}
     score = float(info.get("nodes") or 0)
@@ -533,6 +575,8 @@ def cancel_pending_placement(binary_path=None, config_path=None):
     engine._pending_placement = None
     engine._pending_expected_board = None
     engine._pending_nexts = None
+    engine._pending_falling = None
+    engine._pending_hold_before = None
 
 
 def confirm_pending_placement(binary_path=None, config_path=None):
@@ -543,15 +587,25 @@ def confirm_pending_placement(binary_path=None, config_path=None):
         return
     expected = engine._pending_expected_board
     nexts = engine._pending_nexts
+    falling = engine._pending_falling
+    hold_before = engine._pending_hold_before
     engine._pending_placement = None
     engine._pending_expected_board = None
     engine._pending_nexts = None
+    engine._pending_falling = None
+    engine._pending_hold_before = None
     try:
         engine.confirm_play(placement)
         if expected is not None:
             engine._expected_board = expected
         if nexts is not None:
             engine._last_nexts = list(nexts)
+        # Mirror hold after this play (swap if placement piece != falling).
+        placed = (placement.get("location") or {}).get("type")
+        if placed and falling and placed != falling:
+            engine._cc_hold = falling
+        else:
+            engine._cc_hold = hold_before if hold_before else None
     except Exception as e:
         log_line(f"Cold Clear play failed ({e}); stopping session")
         engine.stop()

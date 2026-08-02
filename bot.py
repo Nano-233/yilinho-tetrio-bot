@@ -140,8 +140,17 @@ def _pick_bettercam_target_probe(screen_resolution):
     return best[1], best[2], best[3], best[4], best[1] >= 1, f"device{best[1]}"
 
 
-def _grab_bettercam(screen_resolution, screen_offset=None):
-    """Grab via bettercam, resized to config resolution. None if unavailable."""
+def _invalidate_bettercam_cache():
+    """Drop cached DXGI frame so the next grab can't reuse a pre-drop image."""
+    global _BETTERCAM_LAST_FRAME
+    _BETTERCAM_LAST_FRAME = None
+
+
+def _grab_bettercam(screen_resolution, screen_offset=None, *, allow_stale=True):
+    """Grab via bettercam, resized to config resolution. None if unavailable.
+
+    allow_stale=False: never reuse the last frame (post-drop board reads).
+    """
     global _BETTERCAM, _BETTERCAM_TRIED, _BETTERCAM_LAST_FRAME, _BETTERCAM_IMPORT_WARNED
     width, height = int(screen_resolution[0]), int(screen_resolution[1])
     try:
@@ -200,18 +209,20 @@ def _grab_bettercam(screen_resolution, screen_offset=None):
 
     if _BETTERCAM is None:
         return None
+    retries = 25 if not allow_stale else 5
     frame = _BETTERCAM[1].grab()
     if frame is None:
-        # No repaint since the last grab — briefly retry, then fall back to
-        # the last real frame (still accurate) rather than let the caller
-        # hit mss's black-frame path on this monitor.
-        for _ in range(5):
+        # No repaint since the last grab — retry. For board-critical reads,
+        # do NOT fall back to a cached pre-drop frame (looks like "stuck" vision).
+        for _ in range(retries):
             time.sleep(0.004)
             frame = _BETTERCAM[1].grab()
             if frame is not None:
                 break
         if frame is None:
-            return _BETTERCAM_LAST_FRAME
+            if allow_stale:
+                return _BETTERCAM_LAST_FRAME
+            return None
     img = Image.fromarray(frame)
     if img.size != (width, height):
         img = img.resize((width, height), Image.BILINEAR)
@@ -219,11 +230,13 @@ def _grab_bettercam(screen_resolution, screen_offset=None):
     return img
 
 
-def capture_screen(screen_offset, screen_resolution):
+def capture_screen(screen_offset, screen_resolution, *, allow_stale=True):
     """Grab a screen region. Coords match pyautogui / calibration.
 
     Prefers bettercam (DXGI) so discrete-GPU monitors aren't black. Falls
     back to mss. Resizes to screen_resolution so calibration coords line up.
+
+    allow_stale=False forces a new DXGI frame (or mss) — use after hard drops.
 
     Note: DXGI must capture from the GPU that *drives* that monitor (Intel for
     the laptop panel, NVIDIA for a dGPU-attached display). That is not the same
@@ -232,7 +245,7 @@ def capture_screen(screen_offset, screen_resolution):
     ensure_dpi_awareness()
     width, height = int(screen_resolution[0]), int(screen_resolution[1])
 
-    img = _grab_bettercam(screen_resolution, screen_offset)
+    img = _grab_bettercam(screen_resolution, screen_offset, allow_stale=allow_stale)
     if img is not None:
         return img
 
@@ -286,15 +299,14 @@ PIECE_MIN_SAT = 80
 PIECE_MIN_VAL = 65
 PIECE_MAX_HUE_DIST = 8  # closest two piece hues are ~17.8 apart
 PIECE_MIN_PIXELS = 8
-# Garbage blocks are a flat grey (near-zero saturation) — unlike any piece
-# hue, so they need their own gate instead of a low sat/val fallback. A loose
-# "bright enough" fallback here previously also matched hue-independent bleed
-# from a custom (non-default) TETR.IO background, painting phantom blocks
-# wherever the scenery showed through the board. If your board background is
-# NOT fully opaque, board reads will be unreliable no matter the thresholds —
-# set it to a solid/opaque background in TETR.IO settings.
-GARBAGE_MAX_SAT = 25
-GARBAGE_MIN_VAL = 90
+# Garbage blocks are desaturated grey — unlike any piece hue. TETR.IO's dark
+# skin garbage is often only val ~55–85 (the old MIN_VAL=90 missed it, so the
+# trust peek thought the stack was empty and ghosts went through cheese).
+# Keep MIN_VAL above near-black empty cells; MAX_SAT rejects blue-tinted empty
+# board. Opaque board background still required — translucent BGs bleed through.
+GARBAGE_MAX_SAT = 45
+GARBAGE_MIN_VAL = 50
+GARBAGE_MAX_VAL = 230  # exclude bright white focus/banner flash
 
 
 def cell_filled(hue, sat, val) -> bool:
@@ -307,7 +319,32 @@ def cell_filled(hue, sat, val) -> bool:
         dist = np.minimum(dist, 255 - dist)
         if np.any(dist.min(axis=1) <= PIECE_MAX_HUE_DIST):
             return True
-    return bool(sat.mean() <= GARBAGE_MAX_SAT and val.mean() >= GARBAGE_MIN_VAL)
+    # Median survives textured/connected-garbage skins better than mean.
+    sat_m = float(np.median(sat))
+    val_m = float(np.median(val))
+    if sat_m <= GARBAGE_MAX_SAT and GARBAGE_MIN_VAL <= val_m <= GARBAGE_MAX_VAL:
+        # Ghost/trail keeps a piece hue at low sat/val — not garbage.
+        if sat_m >= 15:
+            hue_m = float(np.median(hue))
+            dist = np.abs(PIECE_HUES - hue_m)
+            dist = np.minimum(dist, 255 - dist)
+            if float(dist.min()) <= PIECE_MAX_HUE_DIST:
+                return False
+        return True
+    grey = (
+        (sat <= GARBAGE_MAX_SAT)
+        & (val >= GARBAGE_MIN_VAL)
+        & (val <= GARBAGE_MAX_VAL)
+    )
+    if not (grey.size and grey.mean() >= 0.5):
+        return False
+    if sat_m >= 15:
+        hue_m = float(np.median(hue))
+        dist = np.abs(PIECE_HUES - hue_m)
+        dist = np.minimum(dist, 255 - dist)
+        if float(dist.min()) <= PIECE_MAX_HUE_DIST:
+            return False
+    return True
 # Greyed-out held piece after a hold — lower sat/val but hue still valid
 HELD_MIN_SAT = 35
 HELD_MIN_VAL = 30
@@ -348,42 +385,228 @@ DEFAULT_KEYBINDS = {
 # pyautogui adds ~0.1s between actions by default — too slow for tetris
 pyautogui.PAUSE = 0
 
-try:
-    import pydirectinput as _pydirectinput
-    _pydirectinput.PAUSE = 0
-    _USE_DIRECT_INPUT = True
-except ImportError:
-    _pydirectinput = None
-    _USE_DIRECT_INPUT = False
+# Win32 scan-code SendInput. Arrow rotates MUST set KEYEVENTF_EXTENDEDKEY —
+# without it (and with NumLock on), scan 75/77/72 are numpad 4/6/8, so CW/CCW
+# silently no-op while a/d moves still work. The `keyboard` package uses
+# keybd_event without that flag — unusable for arrow binds.
+import ctypes
+
+_PUL = ctypes.POINTER(ctypes.c_ulong)
 
 
-# Instant tap (down/up). Placement gaps come from move/action delay, not hold.
-def tap_key(key, hold_sec=0.0):
-    """Press and release a key. pydirectinput on Windows for browser/desktop."""
-    if _USE_DIRECT_INPUT:
-        _pydirectinput.keyDown(key)
-        if hold_sec > 0:
-            time.sleep(hold_sec)
-        _pydirectinput.keyUp(key)
+class _KeyBdInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", _PUL),
+    ]
+
+
+class _MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", _PUL),
+    ]
+
+
+class _HardwareInput(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_ulong),
+        ("wParamL", ctypes.c_short),
+        ("wParamH", ctypes.c_ushort),
+    ]
+
+
+class _InputUnion(ctypes.Union):
+    _fields_ = [("ki", _KeyBdInput), ("mi", _MouseInput), ("hi", _HardwareInput)]
+
+
+class _Input(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("ii", _InputUnion)]
+
+
+_KEYEVENTF_EXTENDEDKEY = 0x0001
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_SCANCODE = 0x0008
+_INPUT_KEYBOARD = 1
+
+_SCAN = {
+    "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22, "i": 23,
+    "o": 24, "p": 25,
+    "a": 30, "s": 31, "d": 32, "f": 33, "g": 34, "h": 35, "j": 36, "k": 37,
+    "l": 38,
+    "z": 44, "x": 45, "c": 46, "v": 47, "b": 48, "n": 49, "m": 50,
+    **{str(i): (11 if i == 0 else 1 + i) for i in range(10)},
+    "left": 75,
+    "right": 77,
+    "up": 72,
+    "down": 80,
+    "space": 57,
+    "shift": 42,
+    "shiftleft": 42,
+    "lshift": 42,
+    "shiftright": 54,
+    "rshift": 54,
+    "ctrl": 29,
+    "ctrlleft": 29,
+    "lctrl": 29,
+    "ctrlright": 29,
+    "rctrl": 29,
+    "alt": 56,
+    "altleft": 56,
+    "enter": 28,
+    "return": 28,
+    "tab": 15,
+    "esc": 1,
+    "escape": 1,
+}
+# Arrows / right-ctrl / right-alt need the extended flag or they become numpad.
+_EXTENDED_KEYS = frozenset({
+    "left", "right", "up", "down",
+    "ctrlright", "rctrl", "altright", "ralt",
+})
+_ARROW_KEYS = frozenset({"left", "right", "up", "down"})
+# Web/Chrome usually accepts ~8ms taps. Electron (esp. uncapped, no vsync)
+# drops those — soft_drop already needs 80ms for the same reason.
+_MIN_TAP_PULSE_WEB_SEC = 0.008
+_MIN_TAP_PULSE_DESKTOP_SEC = 0.016
+_INPUT_FLOOR_WEB_MS = 16
+_INPUT_FLOOR_DESKTOP_MS = 24
+_MIN_TAP_PULSE_SEC = _MIN_TAP_PULSE_WEB_SEC
+_INPUT_FLOOR_MS = _INPUT_FLOOR_WEB_MS
+_USE_SENDINPUT = os.name == "nt"
+_INPUT_BACKEND = "sendinput-arrows" if _USE_SENDINPUT else "pyautogui"
+_EXTRA = ctypes.c_ulong(0)
+_VK_NUMLOCK = 0x90
+# Virtual-key codes for GetAsyncKeyState (high bit = currently down).
+_VK = {
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "shift": 0x10, "shiftleft": 0xA0, "lshift": 0xA0,
+    "shiftright": 0xA1, "rshift": 0xA1,
+    "ctrl": 0x11, "ctrlleft": 0xA2, "lctrl": 0xA2,
+    "ctrlright": 0xA3, "rctrl": 0xA3,
+    "alt": 0x12, "altleft": 0xA4, "space": 0x20,
+    "enter": 0x0D, "return": 0x0D, "tab": 0x09,
+    "esc": 0x1B, "escape": 0x1B,
+    **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"},
+    **{str(i): 0x30 + i for i in range(10)},
+}
+
+
+def configure_input_for_client(client_mode):
+    """Tune tap pulse / inter-key floor for web vs Electron desktop."""
+    global _MIN_TAP_PULSE_SEC, _INPUT_FLOOR_MS
+    if str(client_mode or "web").lower() == "desktop":
+        _MIN_TAP_PULSE_SEC = _MIN_TAP_PULSE_DESKTOP_SEC
+        _INPUT_FLOOR_MS = _INPUT_FLOOR_DESKTOP_MS
     else:
-        pyautogui.keyDown(key)
-        if hold_sec > 0:
-            time.sleep(hold_sec)
-        pyautogui.keyUp(key)
+        _MIN_TAP_PULSE_SEC = _MIN_TAP_PULSE_WEB_SEC
+        _INPUT_FLOOR_MS = _INPUT_FLOOR_WEB_MS
+
+
+def _key_name(key):
+    return str(key).lower().strip()
+
+
+def _numlock_on():
+    # Low bit of GetKeyState = toggle on. Without the E0 prefix below, arrow
+    # rotates become numpad 4/6/8 when NumLock is on (moves via a/d still work).
+    return bool(ctypes.windll.user32.GetKeyState(_VK_NUMLOCK) & 1)
+
+
+def _key_is_down(key):
+    """True if Windows reports the key currently down."""
+    if not _USE_SENDINPUT:
+        return True  # unknown — caller may still release
+    vk = _VK.get(_key_name(key))
+    if vk is None:
+        return True
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def _sendinput_raw(scan, flags):
+    ii = _InputUnion()
+    ii.ki = _KeyBdInput(0, scan, flags, 0, ctypes.pointer(_EXTRA))
+    inp = _Input(_INPUT_KEYBOARD, ii)
+    return ctypes.windll.user32.SendInput(
+        1, ctypes.byref(inp), ctypes.sizeof(_Input)
+    ) == 1
+
+
+def _sendinput_key(key, *, up=False):
+    name = _key_name(key)
+    scan = _SCAN.get(name)
+    if scan is None:
+        return False
+    # Match pydirectinput: with NumLock on, prefix arrow keyDown with 0xE0 or
+    # KEYEVENTF_EXTENDEDKEY alone still maps to numpad in some hosts (Electron).
+    if not up and name in _ARROW_KEYS and _numlock_on():
+        _sendinput_raw(0xE0, _KEYEVENTF_SCANCODE)
+    flags = _KEYEVENTF_SCANCODE
+    if name in _EXTENDED_KEYS:
+        flags |= _KEYEVENTF_EXTENDEDKEY
+    if up:
+        flags |= _KEYEVENTF_KEYUP
+    return _sendinput_raw(scan, flags)
+
+
+def tap_key(key, hold_sec=0.0):
+    """Press and release a key (scan-code SendInput; arrows are extended)."""
+    pulse = hold_sec if hold_sec > 0 else 0.0
+    if _USE_SENDINPUT and _key_name(key) in _SCAN:
+        if pulse < _MIN_TAP_PULSE_SEC:
+            pulse = _MIN_TAP_PULSE_SEC
+        _sendinput_key(key, up=False)
+        time.sleep(pulse)
+        _sendinput_key(key, up=True)
+        return
+    pyautogui.keyDown(key)
+    if pulse > 0:
+        time.sleep(pulse)
+    pyautogui.keyUp(key)
 
 
 def hold_key(key):
-    if _USE_DIRECT_INPUT:
-        _pydirectinput.keyDown(key)
-    else:
-        pyautogui.keyDown(key)
+    if _USE_SENDINPUT and _key_name(key) in _SCAN:
+        _sendinput_key(key, up=False)
+        return
+    pyautogui.keyDown(key)
 
 
 def release_key(key):
-    if _USE_DIRECT_INPUT:
-        _pydirectinput.keyUp(key)
-    else:
-        pyautogui.keyUp(key)
+    if _USE_SENDINPUT and _key_name(key) in _SCAN:
+        _sendinput_key(key, up=True)
+        return
+    pyautogui.keyUp(key)
+
+
+def release_key_if_held(key):
+    """KEYUP only when the key is actually down.
+
+    Blind KEYUPs (esp. rotate_180=`up`) are queued by Electron and can fire as
+    a real 180 on the next active piece — logs showed L-south landings on
+    paths that only sent move+hard-drop.
+    """
+    if not key:
+        return
+    if _USE_SENDINPUT and not _key_is_down(key):
+        return
+    release_key(key)
+
+
+def release_stuck_keys(keys):
+    """Release DAS-prone keys that are still down. Skips idle rotate KEYUPs."""
+    for k in keys:
+        try:
+            release_key_if_held(k)
+        except Exception:
+            pass
 
 
 def monitor_containing(x, y):
@@ -793,6 +1016,8 @@ class TetrioBot:
         trust_expected_board=True,
         simple_placements=False,
         show_autodrop_ghost=True,
+        client_mode="web",
+        vision_confirm=False,
     ):
         self.keys = dict(DEFAULT_KEYBINDS)
         if keybinds:
@@ -814,6 +1039,11 @@ class TetrioBot:
         # Prefer / require kick+hard-drop paths (no soft-drop tucks).
         self.simple_placements = bool(simple_placements)
         self.show_autodrop_ghost = bool(show_autodrop_ghost)
+        self.client_mode = (
+            "desktop" if str(client_mode or "web").lower() == "desktop" else "web"
+        )
+        configure_input_for_client(self.client_mode)
+        self.vision_confirm = bool(vision_confirm)
         # Optional callback: publish_ghost([(col, row_top), ...], label)
         self.publish_ghost = None
         self._cc_ai_board = None  # bottom-up board at last CC decision
@@ -864,11 +1094,7 @@ class TetrioBot:
         """Request exit ASAP — unblock CC suggest and release stuck keys."""
         self._stop = True
         try:
-            for k in set(self.keys.values()):
-                try:
-                    pyautogui.keyUp(k)
-                except Exception:
-                    pass
+            release_stuck_keys(set(self.keys.values()))
         except Exception:
             pass
         try:
@@ -934,6 +1160,15 @@ class TetrioBot:
             self.simple_placements = bool(config.get("simple_placements"))
         if "show_autodrop_ghost" in config:
             self.show_autodrop_ghost = bool(config.get("show_autodrop_ghost"))
+        if "client_mode" in config:
+            self.client_mode = (
+                "desktop"
+                if str(config.get("client_mode") or "web").lower() == "desktop"
+                else "web"
+            )
+            configure_input_for_client(self.client_mode)
+        if "vision_confirm" in config:
+            self.vision_confirm = bool(config.get("vision_confirm"))
         if "spin_ruleset" in config:
             try:
                 from spin_path import normalize_ruleset
@@ -941,8 +1176,10 @@ class TetrioBot:
             except Exception:
                 self.spin_ruleset = config.get("spin_ruleset") or self.spin_ruleset
 
-    def refresh_screen_image(self):
-        self.screen_image = capture_screen(self.screen_offset, self.screen_resolution)
+    def refresh_screen_image(self, *, allow_stale=True):
+        self.screen_image = capture_screen(
+            self.screen_offset, self.screen_resolution, allow_stale=allow_stale
+        )
 
     def sample_box(self, xy):
         x, y = xy
@@ -1107,13 +1344,19 @@ class TetrioBot:
         block_height = board_image.height / NUM_ROW
 
         board = np.zeros((NUM_ROW, NUM_COL), dtype=np.int32)
+        # ~center 40% of the cell — 3x3 was too easy to land in a dark crack
+        # of connected-garbage textures and miss the block entirely.
+        rx = max(1, int(block_width * 0.2))
+        ry = max(1, int(block_height * 0.2))
         for row in range(NUM_ROW):
             cy = math.floor(row * block_height + block_height / 2)
-            y0, y1 = max(0, cy - 1), min(img_h, cy + 2)
+            y0, y1 = max(0, cy - ry), min(img_h, cy + ry + 1)
             for col in range(NUM_COL):
                 cx = math.floor(col * block_width + block_width / 2)
-                x0, x1 = max(0, cx - 1), min(img_w, cx + 2)
+                x0, x1 = max(0, cx - rx), min(img_w, cx + rx + 1)
                 patch = hsv[y0:y1, x0:x1].reshape(-1, 3)
+                if patch.size == 0:
+                    continue
                 filled = cell_filled(patch[:, 0], patch[:, 1], patch[:, 2])
                 board[row][col] = 1 if filled else 0
         return board
@@ -1183,7 +1426,8 @@ class TetrioBot:
         """Re-read until two consecutive captures match (survives line-clear anim)."""
         prev = None
         for _ in range(BOARD_STABLE_TRIES):
-            self.refresh_screen_image()
+            _invalidate_bettercam_cache()
+            self.refresh_screen_image(allow_stale=False)
             board = self.get_tetris_board()
             if prev is not None and np.array_equal(board, prev):
                 return board
@@ -1220,7 +1464,8 @@ class TetrioBot:
         Caller must clear the overlay ghost first so cyan cells aren't captured.
         """
         time.sleep(LOCK_SETTLE_SEC)
-        self.refresh_screen_image()
+        _invalidate_bettercam_cache()
+        self.refresh_screen_image(allow_stale=False)
         actual = self.get_tetris_board()
         actual_m = actual.copy()
         actual_m[0:SPAWN_MASK_ROWS, :] = 0
@@ -1231,6 +1476,7 @@ class TetrioBot:
             return True, actual_m, exp_m
         # Tiny diffs are often clear-flash / sampling noise — re-read before failing
         time.sleep(CLEAR_SETTLE_SEC if mismatch > 4 else BOARD_STABLE_GAP)
+        _invalidate_bettercam_cache()
         actual = self._read_stable_board()
         actual_m = actual.copy()
         actual_m[0:SPAWN_MASK_ROWS, :] = 0
@@ -1333,10 +1579,12 @@ class TetrioBot:
             path_ok,
         )
 
-        # Web-stable placement taps: 16ms floor, instant down/up, no variance.
-        move_delay = lambda: input_gap_sec_stable(self.move_delay_ms, floor_ms=16)
-        action_delay = lambda: input_gap_sec_stable(self.action_delay_ms, floor_ms=16)
-        tuck_gap = max(MIN_INPUT_GAP_SEC, 0.016)
+        # Desktop/Electron needs a higher floor + longer tap pulse (see
+        # configure_input_for_client); web keeps the 16ms / 8ms pair.
+        floor_ms = _INPUT_FLOOR_MS
+        move_delay = lambda: input_gap_sec_stable(self.move_delay_ms, floor_ms=floor_ms)
+        action_delay = lambda: input_gap_sec_stable(self.action_delay_ms, floor_ms=floor_ms)
+        tuck_gap = max(MIN_INPUT_GAP_SEC, floor_ms / 1000.0)
 
         path = self._path_for_last_cc()
         if not path or not path_ok(path):
@@ -1347,23 +1595,22 @@ class TetrioBot:
             )
             return False
 
-        # Clear any stuck holds (DAS / soft-drop) from a previous aborted path
-        for k in (
-            self.keys["soft_drop"],
-            self.keys["move_left"],
-            self.keys["move_right"],
-            self.keys.get("hold") or "",
-        ):
-            if not k:
-                continue
-            try:
-                release_key(k)
-            except Exception:
-                pass
+        # Only KEYUP keys that are actually down. Blind KEYUP on rotate_180
+        # (`up`) was landing pieces as south on move-only paths in Electron.
+        release_stuck_keys((
+            self.keys.get("soft_drop"),
+            self.keys.get("move_left"),
+            self.keys.get("move_right"),
+            self.keys.get("hold"),
+            self.keys.get("hard_drop"),
+        ))
 
         if need_hold:
             tap_key(self.keys["hold"], hold_sec=0.04)
-            if not self._sleep(max(action_delay(), 0.05)):
+            # Desktop: let hold swap settle before path taps (avoid eating the
+            # freshly spawned piece with deferred input from the hold tap).
+            hold_gap = 0.08 if self.client_mode == "desktop" else 0.05
+            if not self._sleep(max(action_delay(), hold_gap)):
                 return False
 
         key_map = {
@@ -1377,7 +1624,8 @@ class TetrioBot:
 
         tuck = path_needs_tuck(path)
         print(
-            f"  path{' (tuck)' if tuck else ''}: {' '.join(path)}",
+            f"  path{' (tuck)' if tuck else ''}: {' '.join(path)} "
+            f"[{self.client_mode}|{_INPUT_BACKEND}]",
             flush=True,
         )
 
@@ -1385,7 +1633,6 @@ class TetrioBot:
         self.refresh_screen_image()
         pre_queue = self.get_next_pieces()
         after_sd = False
-        after_rot = False
 
         def queue_changed():
             self.refresh_screen_image()
@@ -1416,7 +1663,6 @@ class TetrioBot:
                         return False
                     release_key(self.keys["soft_drop"])
                     after_sd = True
-                    after_rot = False
                     if not self._sleep(tuck_gap):
                         return False
                 elif action in key_map:
@@ -1427,26 +1673,20 @@ class TetrioBot:
                         delay = tuck_gap
                     elif action in (CW, CCW, ROT180):
                         delay = action_delay()
-                        after_rot = True
                     else:
-                        # Small settle after rotate before shifts (kick register)
                         delay = move_delay()
-                        if after_rot:
-                            delay = max(delay, 0.02)
-                            after_rot = False
                     if not self._sleep(delay):
                         return False
             return True
         finally:
-            try:
-                release_key(self.keys["soft_drop"])
-            except Exception:
-                pass
-            try:
-                release_key(self.keys["move_left"])
-                release_key(self.keys["move_right"])
-            except Exception:
-                pass
+            # Stuck move/SD DAS-slams the next piece; never blind-KEYUP rotates.
+            release_stuck_keys((
+                self.keys.get("soft_drop"),
+                self.keys.get("move_left"),
+                self.keys.get("move_right"),
+                self.keys.get("hold"),
+                self.keys.get("hard_drop"),
+            ))
 
     def run(self):
         combo = 0
@@ -1461,10 +1701,13 @@ class TetrioBot:
         print(f"  engine={self.ai_engine}  spin_ruleset={getattr(self, 'spin_ruleset', '?')}"
               f"  cc_think_ms={self.cc_think_ms}  play_mode={self.play_mode}"
               f"  trust_board={self.trust_expected_board}"
-              f"  simple={self.simple_placements}",
+              f"  simple={self.simple_placements}"
+              f"  client={self.client_mode}"
+              f"  vision_confirm={self.vision_confirm}",
               flush=True)
         print(
-            f"  input={'pydirectinput' if _USE_DIRECT_INPUT else 'pyautogui (install pydirectinput)'}",
+            f"  input={_INPUT_BACKEND}  tap={int(_MIN_TAP_PULSE_SEC * 1000)}ms"
+            f"  floor={_INPUT_FLOOR_MS}ms",
             flush=True,
         )
         self.refresh_screen_image()
@@ -1539,7 +1782,8 @@ class TetrioBot:
             # One-frame peek still catches garbage/desync without spawn-settle.
             use_trust = self.trust_expected_board and self._board_trusted
             if use_trust:
-                self.refresh_screen_image()
+                _invalidate_bettercam_cache()
+                self.refresh_screen_image(allow_stale=False)
                 peek = self.get_tetris_board()
                 peek_m = peek.copy()
                 peek_m[0:SPAWN_MASK_ROWS, :] = 0
@@ -1549,8 +1793,12 @@ class TetrioBot:
                     current_board = exp_m
                     raw_board = expected_board
                 else:
+                    extra = int(np.sum((peek_m == 1) & (exp_m == 0)))
+                    missing = int(np.sum((peek_m == 0) & (exp_m == 1)))
                     print(
-                        "  board peek mismatch (garbage/desync?) — vision resync",
+                        "  board peek mismatch (garbage/desync?) — vision resync "
+                        f"(+{extra}/-{missing} cells, peek={int(peek_m.sum())} "
+                        f"expected={int(exp_m.sum())})",
                         flush=True,
                     )
                     self._board_trusted = False
@@ -1590,9 +1838,9 @@ class TetrioBot:
             # Empty hold at game start is normal — CC treats hold=null correctly.
             # Do NOT auto-press hold here; that skipped the first real cycles.
             if held_piece is None and self.last_held_piece is not None:
-                # Hold was used this cycle; slot looks empty but AI still
-                # needs a label — use current piece (hold == current → no swap).
-                held_piece = current_piece
+                # Greyed-out hold: keep last known held piece (NOT current —
+                # faking hold=current desynced CC and ran the wrong path).
+                held_piece = self.last_held_piece
 
             t1 = time.time()
             # Screen scan uses row 0 = top; AI engines use row 0 = bottom.
@@ -1852,12 +2100,13 @@ class TetrioBot:
                 self._board_trusted = False
                 continue
 
-            # Trust path (web-stable): confirm without waiting out clear flash.
-            # Next-loop peek still catches garbage / real misses.
+            # vision_confirm on: check screen vs expected before CC confirm.
+            # off: trust-confirm when trust_expected (fast; peek catches desync next).
             board_already_stable = False
             if self.ai_engine == "cold_clear":
                 if (
-                    self.trust_expected_board
+                    not self.vision_confirm
+                    and self.trust_expected_board
                     and mode == "autodrop"
                     and placed
                 ):
@@ -1902,9 +2151,10 @@ class TetrioBot:
             if board_already_stable:
                 settle = 0
             else:
+                floor_ms = _INPUT_FLOOR_MS
                 settle = LOCK_SETTLE_SEC
                 if self.play_mode == "autodrop":
-                    settle += input_gap_sec_stable(self.action_delay_ms, floor_ms=16)
+                    settle += input_gap_sec_stable(self.action_delay_ms, floor_ms=floor_ms)
                 if int(expected_board.sum()) < int(current_board.sum()):
                     settle += CLEAR_SETTLE_SEC
             if settle > 0:
@@ -1962,6 +2212,8 @@ def bot_from_config(config, debug=False, pause_sec=0):
         trust_expected_board=config.get("trust_expected_board", True),
         simple_placements=config.get("simple_placements", False),
         show_autodrop_ghost=config.get("show_autodrop_ghost", True),
+        client_mode=config.get("client_mode", "web"),
+        vision_confirm=config.get("vision_confirm", False),
     )
 
 
@@ -1978,6 +2230,13 @@ def _self_check():
 
     assert cell_filled([0] * 9, [5] * 9, [130] * 9), \
         "flat mid-grey garbage should read as filled"
+    assert cell_filled([0] * 9, [10] * 9, [60] * 9), \
+        "dark TETR.IO garbage (val~60) should read as filled"
+    # Hue far from any piece (pieces cluster ~0–200); sat still in garbage band.
+    assert cell_filled([100] * 9, [35] * 9, [70] * 9), \
+        "slightly tinted garbage should read as filled"
+    assert not cell_filled([0] * 9, [5] * 9, [30] * 9), \
+        "near-black empty should not read as garbage"
 
     # Ghost piece: real colour hue, but faded well below real-block sat/val —
     # must NOT be counted, or the AI thinks a spawn preview is a locked block.
