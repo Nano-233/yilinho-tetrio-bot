@@ -28,9 +28,9 @@
     719,
     348
   ],
-  "move_delay_ms": 30,
-  "action_delay_ms": 50,
-  "delay_variance_percent": 20,
+  "move_delay_ms": 0,
+  "action_delay_ms": 0,
+  "delay_variance_percent": 0,
   "keybinds": {
     "move_left": "a",
     "move_right": "d",
@@ -46,5 +46,6 @@
   "pruning_breadth": 5,
   "ai_engine": "cold_clear",
   "spin_ruleset": "all_mini_plus",
-  "play_mode": "autodrop"
+  "play_mode": "autodrop",
+  "cc_think_ms": 50
 }

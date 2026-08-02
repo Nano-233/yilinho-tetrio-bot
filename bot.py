@@ -316,16 +316,17 @@ QUEUE_READ_RETRIES = 6
 QUEUE_READ_DELAY = 0.025
 MAX_UNREADABLE_POLLS = 40
 SPAWN_MASK_ROWS = 4       # top rows — active piece lives here, hide from AI
-LOCK_SETTLE_SEC = 0.08    # wait after hard drop before next read
+LOCK_SETTLE_SEC = 0.05    # wait after hard drop before next read
 SPAWN_COLUMN = 3          # default piece spawn column for movement math (legacy left-edge)
 SPAWN_CENTER_X = 4        # guideline SRS center x (Cold Clear / TBP)
-SPAWN_SETTLE_SEC = 0.12   # wait after queue shift before reading pieces
+SPAWN_SETTLE_SEC = 0.06   # wait after queue shift before reading pieces
+MIN_INPUT_GAP_SEC = 0.001   # ~1 frame when move/action delay is 0
 DEFAULT_PAUSE_SEC = 3.0   # --pause: seconds to wait before each drop
 
 # Default delay settings (in milliseconds)
-DEFAULT_MOVE_DELAY_MS = 30
-DEFAULT_ACTION_DELAY_MS = 50
-DEFAULT_DELAY_VARIANCE_PERCENT = 20
+DEFAULT_MOVE_DELAY_MS = 0
+DEFAULT_ACTION_DELAY_MS = 0
+DEFAULT_DELAY_VARIANCE_PERCENT = 0
 CALIBRATION_COUNTDOWN_SEC = 5
 STARTUP_COUNTDOWN_SEC = 5
 
@@ -347,6 +348,7 @@ pyautogui.PAUSE = 0
 
 try:
     import pydirectinput as _pydirectinput
+    _pydirectinput.PAUSE = 0
     _USE_DIRECT_INPUT = True
 except ImportError:
     _pydirectinput = None
@@ -702,9 +704,16 @@ def run_calibration_wizard(config_path=CONFIG_FILE):
     return config
 
 
-wait_time = 0.03
-soft_drop_delay = 0.1
+wait_time = 0.01
+soft_drop_delay = 0.03
 # Game Settings - DAS 40ms, ARR 0ms, SDF max, lowest graphic
+
+
+def input_gap_sec(base_delay_ms, variance_percent):
+    """Delay between inputs; 0 ms config still leaves one frame for the game."""
+    if base_delay_ms <= 0:
+        return MIN_INPUT_GAP_SEC
+    return get_delay_with_variance(base_delay_ms, variance_percent)
 
 
 def get_delay_with_variance(base_delay_ms, variance_percent):
@@ -748,7 +757,7 @@ class TetrioBot:
         cc_weights=None,
         play_mode="autodrop",
         spin_ruleset="all_mini_plus",
-        cc_think_ms=150,
+        cc_think_ms=50,
     ):
         self.keys = dict(DEFAULT_KEYBINDS)
         if keybinds:
@@ -765,7 +774,7 @@ class TetrioBot:
             self.spin_ruleset = normalize_ruleset(spin_ruleset)
         except Exception:
             self.spin_ruleset = spin_ruleset or "all_mini_plus"
-        self.cc_think_ms = cc_think_ms or 150
+        self.cc_think_ms = cc_think_ms or 50
         # Optional callback: publish_ghost([(col, row_top), ...], label)
         self.publish_ghost = None
         self._cc_ai_board = None  # bottom-up board at last CC decision
@@ -875,7 +884,7 @@ class TetrioBot:
         if "cc_weights" in config:
             self.cc_weights = config.get("cc_weights")
         if "cc_think_ms" in config:
-            self.cc_think_ms = config.get("cc_think_ms") or 150
+            self.cc_think_ms = config.get("cc_think_ms") or 50
         if "spin_ruleset" in config:
             try:
                 from spin_path import normalize_ruleset
@@ -999,8 +1008,8 @@ class TetrioBot:
 
     def place_piece(self, best_position, rotations, need_hold):
         """Place a piece with configurable delays for more human-like inputs."""
-        move_delay = lambda: get_delay_with_variance(self.move_delay_ms, self.delay_variance_percent)
-        action_delay = lambda: get_delay_with_variance(self.action_delay_ms, self.delay_variance_percent)
+        move_delay = lambda: input_gap_sec(self.move_delay_ms, self.delay_variance_percent)
+        action_delay = lambda: input_gap_sec(self.action_delay_ms, self.delay_variance_percent)
 
         if need_hold:
             tap_key(self.keys["hold"])
@@ -1108,8 +1117,8 @@ class TetrioBot:
             path_for_placement,
         )
 
-        move_delay = lambda: get_delay_with_variance(self.move_delay_ms, self.delay_variance_percent)
-        action_delay = lambda: get_delay_with_variance(self.action_delay_ms, self.delay_variance_percent)
+        move_delay = lambda: input_gap_sec(self.move_delay_ms, self.delay_variance_percent)
+        action_delay = lambda: input_gap_sec(self.action_delay_ms, self.delay_variance_percent)
 
         placement = None
         try:
@@ -1552,7 +1561,7 @@ def bot_from_config(config, debug=False, pause_sec=0):
         cc_weights=config.get("cc_weights"),
         play_mode=config.get("play_mode", "autodrop"),
         spin_ruleset=config.get("spin_ruleset", "all_mini_plus"),
-        cc_think_ms=config.get("cc_think_ms", 150),
+        cc_think_ms=config.get("cc_think_ms", 50),
     )
 
 
@@ -1691,7 +1700,7 @@ def main():
             cc_binary=config.get('cc_binary'),
             cc_weights=config.get('cc_weights'),
             spin_ruleset=args.spin_ruleset or config.get('spin_ruleset', 'all_mini_plus'),
-            cc_think_ms=config.get('cc_think_ms', 150),
+            cc_think_ms=config.get('cc_think_ms', 50),
         )
     else:
         # Use default/hardcoded values
@@ -1723,7 +1732,7 @@ def main():
             pause_sec=args.pause,
             ai_engine=args.ai_engine or 'legacy',
             spin_ruleset=args.spin_ruleset or 'all_mini_plus',
-            cc_think_ms=150,
+            cc_think_ms=50,
         )
 
     if args.pause > 0:

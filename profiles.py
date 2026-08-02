@@ -31,7 +31,7 @@ DEFAULT_AI = {
     "pruning_breadth": 5,
     "ai_engine": "legacy",  # "legacy" | "cold_clear"
     "spin_ruleset": "all_mini_plus",
-    "cc_think_ms": 150,
+    "cc_think_ms": 50,
 }
 
 

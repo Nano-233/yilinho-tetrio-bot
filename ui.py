@@ -523,7 +523,7 @@ class ControlPanel(QtWidgets.QMainWindow):
         self.cc_think_ms = QtWidgets.QSpinBox()
         self.cc_think_ms.setRange(0, 2000)
         self.cc_think_ms.setSuffix(" ms")
-        self.cc_think_ms.setValue(150)
+        self.cc_think_ms.setValue(50)
         self.cc_think_ms.setToolTip(
             "Sleep before each Cold Clear suggest() so CC accumulates search nodes."
         )
@@ -701,7 +701,7 @@ class ControlPanel(QtWidgets.QMainWindow):
             if idx >= 0:
                 self.spin_ruleset.setCurrentIndex(idx)
         if hasattr(self, "cc_think_ms"):
-            self.cc_think_ms.setValue(int(cfg.get("cc_think_ms", 150)))
+            self.cc_think_ms.setValue(int(cfg.get("cc_think_ms", 50)))
         self._sync_legacy_ai_controls()
         binds = cfg.get("keybinds") or {}
         for key, edit in self.game_bind_edits.items():
