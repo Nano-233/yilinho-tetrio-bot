@@ -63,8 +63,8 @@ _STATE = {
 YELLOW = RgbaColor(255, 255, 0, 220)
 GREEN = RgbaColor(0, 255, 0, 220)
 PURPLE = RgbaColor(255, 0, 255, 220)
-GHOST_FILL = RgbaColor(0, 255, 255, 200)
-GHOST_OUTLINE = RgbaColor(255, 255, 0, 255)  # yellow outline so cells pop on stack
+GHOST_FILL = RgbaColor(0, 255, 255, 70)  # translucent — must not trip vision
+GHOST_OUTLINE = RgbaColor(0, 255, 255, 140)  # yellow outline so cells pop on stack
 
 GAME_BIND_LABELS = [
     ("move_left", "Move left"),
@@ -257,7 +257,7 @@ def build_ghost_shapes(config, cells, label=""):
         cw = max(1, int(cell_w) - 1)
         ch = max(1, int(cell_h) - 1)
         shapes.append(FlDrawRect(
-            Vector2D(x, y), cw, ch, GHOST_FILL, GHOST_OUTLINE, 3
+            Vector2D(x, y), cw, ch, GHOST_FILL, GHOST_OUTLINE, 2
         ))
     if label:
         shapes.append(DrawText(
@@ -636,6 +636,24 @@ class ControlPanel(QtWidgets.QMainWindow):
             "garbage/desync and falls back to vision. Uncheck if ghosts look wrong."
         )
         form.addRow("", self.trust_expected)
+        self.simple_placements = QtWidgets.QCheckBox(
+            "Simple placements (no soft-drop tucks)"
+        )
+        self.simple_placements.setChecked(False)
+        self.simple_placements.setToolTip(
+            "Only allow kick/rotate + hard-drop paths. Skips CC moves that need "
+            "mid-stack soft-drop slides. Prefer kick paths automatically either way."
+        )
+        form.addRow("", self.simple_placements)
+        self.show_autodrop_ghost = QtWidgets.QCheckBox(
+            "Show ghost in autodrop (debug)"
+        )
+        self.show_autodrop_ghost.setChecked(True)
+        self.show_autodrop_ghost.setToolTip(
+            "Draw the cyan target while autodropping so you can see if keys hit it. "
+            "Ghost is cleared before any board read so it does not pollute vision."
+        )
+        form.addRow("", self.show_autodrop_ghost)
         self.ai_legacy.toggled.connect(self._sync_legacy_ai_controls)
         self.ai_cc.toggled.connect(self._sync_legacy_ai_controls)
         self._legacy_ai_widgets = (self.mp, self.pruning_moves, self.pruning_breadth)
@@ -747,6 +765,10 @@ class ControlPanel(QtWidgets.QMainWindow):
             cfg["cc_think_ms"] = self.cc_think_ms.value()
         if hasattr(self, "trust_expected"):
             cfg["trust_expected_board"] = self.trust_expected.isChecked()
+        if hasattr(self, "simple_placements"):
+            cfg["simple_placements"] = self.simple_placements.isChecked()
+        if hasattr(self, "show_autodrop_ghost"):
+            cfg["show_autodrop_ghost"] = self.show_autodrop_ghost.isChecked()
         binds = dict(DEFAULT_KEYBINDS)
         for key, edit in self.game_bind_edits.items():
             val = edit.text().strip().lower()
@@ -815,6 +837,14 @@ class ControlPanel(QtWidgets.QMainWindow):
         if hasattr(self, "trust_expected"):
             self.trust_expected.setChecked(
                 bool(cfg.get("trust_expected_board", True))
+            )
+        if hasattr(self, "simple_placements"):
+            self.simple_placements.setChecked(
+                bool(cfg.get("simple_placements", False))
+            )
+        if hasattr(self, "show_autodrop_ghost"):
+            self.show_autodrop_ghost.setChecked(
+                bool(cfg.get("show_autodrop_ghost", True))
             )
         self._sync_legacy_ai_controls()
         binds = cfg.get("keybinds") or {}

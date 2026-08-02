@@ -357,13 +357,17 @@ except ImportError:
     _USE_DIRECT_INPUT = False
 
 
-def tap_key(key):
+def tap_key(key, hold_sec=0.0):
     """Press and release a key. pydirectinput on Windows for browser games."""
     if _USE_DIRECT_INPUT:
         _pydirectinput.keyDown(key)
+        if hold_sec > 0:
+            time.sleep(hold_sec)
         _pydirectinput.keyUp(key)
     else:
         pyautogui.keyDown(key)
+        if hold_sec > 0:
+            time.sleep(hold_sec)
         pyautogui.keyUp(key)
 
 
@@ -721,17 +725,26 @@ def run_calibration_wizard(config_path=CONFIG_FILE):
 
 
 wait_time = 0.01
-soft_drop_delay = 0.03
+# SDF max/inf: brief hold is enough to sonic; too short and Electron drops the key.
+soft_drop_delay = 0.08
 # Extra wait after line clears — TETR.IO animates; mid-clear vision desyncs CC.
 CLEAR_SETTLE_SEC = 0.12
-# Game Settings - DAS 40ms, ARR 0ms, SDF max, lowest graphic
+# Game Settings tip: ARR 0, DAS ~100–150ms ok (bot taps), SDF max/inf, DCD 0
 
 
-def input_gap_sec(base_delay_ms, variance_percent):
+def input_gap_sec(base_delay_ms, variance_percent, *, floor_ms=0):
     """Delay between inputs; 0 ms config still leaves one frame for the game."""
     if base_delay_ms <= 0:
-        return MIN_INPUT_GAP_SEC
-    return get_delay_with_variance(base_delay_ms, variance_percent)
+        return max(MIN_INPUT_GAP_SEC, floor_ms / 1000.0)
+    sec = get_delay_with_variance(base_delay_ms, variance_percent)
+    return max(sec, floor_ms / 1000.0)
+
+
+def input_gap_sec_stable(base_delay_ms, *, floor_ms=0):
+    """Placement taps: no random variance (variance caused rare dropped inputs)."""
+    if base_delay_ms <= 0:
+        return max(MIN_INPUT_GAP_SEC, floor_ms / 1000.0)
+    return max(base_delay_ms / 1000.0, floor_ms / 1000.0, MIN_INPUT_GAP_SEC)
 
 
 def get_delay_with_variance(base_delay_ms, variance_percent):
@@ -777,6 +790,8 @@ class TetrioBot:
         spin_ruleset="all_mini_plus",
         cc_think_ms=50,
         trust_expected_board=True,
+        simple_placements=False,
+        show_autodrop_ghost=True,
     ):
         self.keys = dict(DEFAULT_KEYBINDS)
         if keybinds:
@@ -795,6 +810,9 @@ class TetrioBot:
             self.spin_ruleset = spin_ruleset or "all_mini_plus"
         self.cc_think_ms = 50 if cc_think_ms is None else int(cc_think_ms)
         self.trust_expected_board = bool(trust_expected_board)
+        # Prefer / require kick+hard-drop paths (no soft-drop tucks).
+        self.simple_placements = bool(simple_placements)
+        self.show_autodrop_ghost = bool(show_autodrop_ghost)
         # Optional callback: publish_ghost([(col, row_top), ...], label)
         self.publish_ghost = None
         self._cc_ai_board = None  # bottom-up board at last CC decision
@@ -911,6 +929,10 @@ class TetrioBot:
             self.cc_think_ms = 50 if v is None else int(v)
         if "trust_expected_board" in config:
             self.trust_expected_board = bool(config.get("trust_expected_board"))
+        if "simple_placements" in config:
+            self.simple_placements = bool(config.get("simple_placements"))
+        if "show_autodrop_ghost" in config:
+            self.show_autodrop_ghost = bool(config.get("show_autodrop_ghost"))
         if "spin_ruleset" in config:
             try:
                 from spin_path import normalize_ruleset
@@ -1109,8 +1131,8 @@ class TetrioBot:
             time.sleep(BOARD_STABLE_GAP)
         return prev if prev is not None else self.get_tetris_board()
 
-    def _path_for_last_cc(self):
-        """BFS inputs (incl. soft-drop tucks) to last CC placement, or None."""
+    def _path_for_last_cc(self, simple_only=None):
+        """BFS inputs to last CC placement, or None if unreachable."""
         try:
             from cold_clear import get_shared_engine
             from spin_path import path_for_placement
@@ -1118,12 +1140,41 @@ class TetrioBot:
             placement = getattr(eng, "last_placement", None)
             if placement is None or self._cc_ai_board is None:
                 return None
+            if simple_only is None:
+                simple_only = self.simple_placements
             return path_for_placement(
-                self._cc_ai_board, placement, self.spin_ruleset
+                self._cc_ai_board,
+                placement,
+                self.spin_ruleset,
+                simple_only=bool(simple_only),
             )
         except Exception as e:
             print(f"  path lookup failed: {e}", flush=True)
             return None
+
+    def _board_matches_expected(self, expected_board, *, quick=False):
+        """Vision vs expected (spawn-masked). Used after drop before CC confirm.
+
+        quick=True (autodrop happy path): one capture after a short settle.
+        Only does the multi-frame stable read if that first peek mismatches.
+        Caller must clear the overlay ghost first so cyan cells aren't captured.
+        """
+        time.sleep(LOCK_SETTLE_SEC)
+        self.refresh_screen_image()
+        actual = self.get_tetris_board()
+        actual_m = actual.copy()
+        actual_m[0:SPAWN_MASK_ROWS, :] = 0
+        exp_m = expected_board.copy()
+        exp_m[0:SPAWN_MASK_ROWS, :] = 0
+        mismatch = int(np.sum(actual_m != exp_m))
+        if mismatch == 0:
+            return True, actual_m, exp_m
+        # Tiny diffs are often clear-flash / sampling noise — re-read before failing
+        time.sleep(CLEAR_SETTLE_SEC if mismatch > 4 else BOARD_STABLE_GAP)
+        actual = self._read_stable_board()
+        actual_m = actual.copy()
+        actual_m[0:SPAWN_MASK_ROWS, :] = 0
+        return int(np.sum(actual_m != exp_m)) == 0, actual_m, exp_m
 
     def _verify_suggest_placement(self, expected_board):
         """After a manual drop in suggest mode: does vision match AI expected?
@@ -1209,36 +1260,53 @@ class TetrioBot:
             return []
 
     def place_cc(self, center_x, rot_index, need_hold):
-        """Execute Cold Clear placement.
+        """Execute Cold Clear placement via BFS path.
 
-        Always prefers SRS BFS path (soft-drop tucks + slides). Greedy
-        rotate→shift→hard-drop cannot reach under overhangs — CC assumes that.
+        Returns:
+          True  — path finished (hard drop sent)
+          False — could not start / stopped (caller may hard-drop to unstick)
+          None  — piece already locked mid-path (do NOT send more keys)
         """
         from spin_path import (
             CW, CCW, ROT180, LEFT, RIGHT, SD, HD,
+            path_needs_tuck,
+            path_ok,
         )
 
-        move_delay = lambda: input_gap_sec(self.move_delay_ms, self.delay_variance_percent)
-        action_delay = lambda: input_gap_sec(self.action_delay_ms, self.delay_variance_percent)
+        # No variance on place taps — ±20% occasionally dropped inputs (~1/20).
+        # Floor is ~1 frame only; config move/action delays apply above that.
+        move_delay = lambda: input_gap_sec_stable(self.move_delay_ms, floor_ms=16)
+        action_delay = lambda: input_gap_sec_stable(self.action_delay_ms, floor_ms=16)
+        tuck_gap = max(MIN_INPUT_GAP_SEC, 0.016)
 
-        placement = None
-        try:
-            from cold_clear import get_shared_engine
-            placement = getattr(
-                get_shared_engine(self.cc_binary, self.cc_weights),
-                "last_placement",
-                None,
+        path = self._path_for_last_cc()
+        if not path or not path_ok(path):
+            print(
+                "  SKIP place: no short executable path to CC ghost "
+                f"(simple={self.simple_placements}, path={path})",
+                flush=True,
             )
-        except Exception:
-            placement = None
+            return False
+
+        # Clear any stuck holds (DAS / soft-drop) from a previous aborted path
+        for k in (
+            self.keys["soft_drop"],
+            self.keys["move_left"],
+            self.keys["move_right"],
+            self.keys.get("hold") or "",
+        ):
+            if not k:
+                continue
+            try:
+                release_key(k)
+            except Exception:
+                pass
 
         if need_hold:
-            tap_key(self.keys["hold"])
-            if not self._sleep(action_delay()):
-                return
-
-        spin = (placement or {}).get("spin", "none") or "none"
-        path = self._path_for_last_cc()
+            # Shift needs a slightly longer down pulse on some setups
+            tap_key(self.keys["hold"], hold_sec=0.04)
+            if not self._sleep(max(action_delay(), 0.05)):
+                return False
 
         key_map = {
             LEFT: self.keys["move_left"],
@@ -1249,78 +1317,78 @@ class TetrioBot:
             HD: self.keys["hard_drop"],
         }
 
-        def do_rotate(idx):
-            if self._stop:
-                return
-            if idx == 1:
-                tap_key(self.keys["rotate_cw"])
-            elif idx == 2:
-                tap_key(self.keys["rotate_180"])
-            elif idx == 3:
-                tap_key(self.keys["rotate_ccw"])
-            else:
-                return
-            self._sleep(action_delay())
-
-        def do_shift(cx):
-            dx = int(cx) - SPAWN_CENTER_X
-            if dx < 0:
-                for _ in range(-dx):
-                    if self._stop:
-                        return
-                    tap_key(self.keys["move_left"])
-                    if not self._sleep(move_delay()):
-                        return
-            elif dx > 0:
-                for _ in range(dx):
-                    if self._stop:
-                        return
-                    tap_key(self.keys["move_right"])
-                    if not self._sleep(move_delay()):
-                        return
-
-        if path:
-            has_sd = SD in path
-            print(
-                f"  path{' (soft-drop tuck)' if has_sd else ''}: {' '.join(path)}",
-                flush=True,
-            )
-            for action in path:
-                if self._stop:
-                    try:
-                        release_key(self.keys["soft_drop"])
-                    except Exception:
-                        pass
-                    return
-                if action == SD:
-                    # Sonic soft-drop (SDF max): hold briefly to floor/rest
-                    hold_key(self.keys["soft_drop"])
-                    if not self._sleep(soft_drop_delay):
-                        release_key(self.keys["soft_drop"])
-                        return
-                    release_key(self.keys["soft_drop"])
-                    if not self._sleep(move_delay()):
-                        return
-                elif action in key_map:
-                    tap_key(key_map[action])
-                    delay = action_delay() if action in (CW, CCW, ROT180, HD) else move_delay()
-                    if not self._sleep(delay):
-                        return
-            return
-
-        # Greedy fallback — only flat tops; wrong for tucks under walls
-        if self._stop:
-            return
+        tuck = path_needs_tuck(path)
         print(
-            f"  greedy FALLBACK (no path): rot={rot_index} x={center_x} spin={spin}",
+            f"  path{' (tuck)' if tuck else ''}: {' '.join(path)}",
             flush=True,
         )
-        do_rotate(rot_index)
-        do_shift(center_x)
-        if self._stop:
-            return
-        tap_key(self.keys["hard_drop"])
-        self._sleep(action_delay())
+
+        # Snapshot next-queue; if it changes, our piece locked early.
+        self.refresh_screen_image()
+        pre_queue = self.get_next_pieces()
+        after_sd = False
+        after_rot = False
+
+        def queue_changed():
+            self.refresh_screen_image()
+            cur = self.get_next_pieces()
+            if pre_queue is None or cur is None:
+                return False
+            if any(p is None for p in pre_queue) or any(p is None for p in cur):
+                return False
+            return cur != pre_queue
+
+        try:
+            for i, action in enumerate(path):
+                if self._stop:
+                    return False
+                if i > 0 and (i % 2 == 0 or after_sd) and queue_changed():
+                    print(
+                        "  ABORT path: queue changed mid-inputs "
+                        "(piece locked — not thrashing next spawn)",
+                        flush=True,
+                    )
+                    return None
+
+                if action == SD:
+                    hold_key(self.keys["soft_drop"])
+                    # Tucks need a reliable sonic; slightly longer hold
+                    sd_hold = soft_drop_delay + (0.04 if tuck else 0.0)
+                    if not self._sleep(sd_hold):
+                        return False
+                    release_key(self.keys["soft_drop"])
+                    after_sd = True
+                    after_rot = False
+                    if not self._sleep(tuck_gap):
+                        return False
+                elif action in key_map:
+                    tap_key(key_map[action])
+                    if action == HD:
+                        break
+                    if after_sd:
+                        delay = tuck_gap
+                    elif action in (CW, CCW, ROT180):
+                        delay = action_delay()
+                        after_rot = True
+                    else:
+                        # Small settle after rotate before shifts (kick register)
+                        delay = move_delay()
+                        if after_rot:
+                            delay = max(delay, 0.02)
+                            after_rot = False
+                    if not self._sleep(delay):
+                        return False
+            return True
+        finally:
+            try:
+                release_key(self.keys["soft_drop"])
+            except Exception:
+                pass
+            try:
+                release_key(self.keys["move_left"])
+                release_key(self.keys["move_right"])
+            except Exception:
+                pass
 
     def run(self):
         combo = 0
@@ -1334,7 +1402,8 @@ class TetrioBot:
         print("TetrioBot started. Waiting for game...", flush=True)
         print(f"  engine={self.ai_engine}  spin_ruleset={getattr(self, 'spin_ruleset', '?')}"
               f"  cc_think_ms={self.cc_think_ms}  play_mode={self.play_mode}"
-              f"  trust_board={self.trust_expected_board}",
+              f"  trust_board={self.trust_expected_board}"
+              f"  simple={self.simple_placements}",
               flush=True)
         print(
             f"  input={'pydirectinput' if _USE_DIRECT_INPUT else 'pyautogui (install pydirectinput)'}",
@@ -1572,25 +1641,32 @@ class TetrioBot:
                       flush=True)
                 time.sleep(self.pause_sec)
 
-            # Ghost overlay (suggest mode always; also useful briefly in autodrop)
+            # Ghost: always in suggest; optional in autodrop (debug aim).
+            # Cleared before every board read so cyan does not pollute vision.
             if self.ai_engine == "cold_clear":
                 ghost = self._ghost_cells_cc()
                 path = self._path_for_last_cc()
-                from spin_path import SD as _SD
+                from spin_path import SD as _SD, path_needs_tuck
                 if path is None:
                     reach = " NO-PATH"
-                elif _SD in path:
+                elif path_needs_tuck(path):
                     reach = " soft-drop"
+                elif _SD in path:
+                    reach = ""  # sd only as sonic into hd — fine
                 else:
                     reach = ""
             else:
                 ghost = self._ghost_cells_legacy(
                     ai_board, place_piece, position, rotations
                 )
+                path = None
                 reach = ""
             mode = self.play_mode
             ghost_label = (
                 f"{'HOLD+' if need_hold else ''}{place_piece} [{mode}]{reach}"
+            )
+            show_ghost = mode == "suggest" or (
+                mode == "autodrop" and self.show_autodrop_ghost
             )
             if not ghost:
                 print(
@@ -1605,16 +1681,39 @@ class TetrioBot:
                 )
                 if reach == " NO-PATH":
                     print(
-                        "  WARNING: CC placement has no soft-drop path from spawn "
-                        "(kick tables / board desync). Ghost may look impossible.",
+                        "  WARNING: unreachable placement — will not autodrop this one.",
                         flush=True,
                     )
                 elif reach == " soft-drop":
                     print(
-                        "  note: needs soft-drop tuck/slide — hard-drop alone won't reach",
+                        "  note: soft-drop tuck (enable 'Simple placements' to skip these)",
                         flush=True,
                     )
-            self._emit_ghost(ghost, ghost_label)
+            # Suggest + simple: hide hard-tech / impossible ghosts
+            if (
+                mode == "suggest"
+                and self.simple_placements
+                and reach in (" NO-PATH", " soft-drop")
+            ):
+                print(
+                    "  simple mode: skipping hard-tech suggestion (place anything / hold)",
+                    flush=True,
+                )
+                if self.ai_engine == "cold_clear":
+                    from cold_clear import cancel_pending_placement
+                    cancel_pending_placement(self.cc_binary, self.cc_weights)
+                self._board_trusted = False
+                self._emit_ghost([], f"SKIP hard-tech [{mode}]")
+                ghost = []
+            elif show_ghost:
+                self._emit_ghost(ghost, ghost_label)
+            else:
+                self._clear_ghost()
+
+            # Brief pause so the overlay can paint before keys fire (autodrop debug).
+            # Keep short — long waits let gravity move the piece off the BFS spawn assumption.
+            if show_ghost and mode == "autodrop" and ghost:
+                self._sleep(0.02)
 
             placed = False
             decision_queue = list(next_pieces) if next_pieces is not None else None
@@ -1622,9 +1721,44 @@ class TetrioBot:
                 mode = self.play_mode
                 if mode == "autodrop":
                     if self.ai_engine == "cold_clear":
-                        self.place_cc(
+                        if reach == " NO-PATH" or (
+                            self.simple_placements and reach == " soft-drop"
+                        ):
+                            print(
+                                "  autodrop: skip unreachable/hard-tech — "
+                                "cancel CC pending, vision resync next piece",
+                                flush=True,
+                            )
+                            from cold_clear import cancel_pending_placement
+                            cancel_pending_placement(
+                                self.cc_binary, self.cc_weights
+                            )
+                            self._board_trusted = False
+                            self._clear_ghost()
+                            # Don't hard-drop randomly — wait for user or next cycle.
+                            # Soft-drop once so the piece isn't stuck forever? Better:
+                            # hard-drop in place so queue advances (may be wrong stack).
+                            tap_key(self.keys["hard_drop"])
+                            placed = False
+                            break
+                        ok = self.place_cc(
                             position, rotations[0] if rotations else 0, need_hold
                         )
+                        if ok is True:
+                            placed = True
+                            break
+                        from cold_clear import cancel_pending_placement
+                        cancel_pending_placement(
+                            self.cc_binary, self.cc_weights
+                        )
+                        self._board_trusted = False
+                        self._clear_ghost()
+                        if ok is False:
+                            # Never started / aborted before lock — unstick board
+                            tap_key(self.keys["hard_drop"])
+                        # ok is None: piece already locked; do not tap again
+                        placed = False
+                        break
                     else:
                         self.place_piece(target_col, rotations, need_hold)
                     placed = True
@@ -1650,15 +1784,39 @@ class TetrioBot:
             if not placed:
                 if self._stop:
                     break
+                # Autodrop skip / suggest mismatch: resync from vision next loop
+                self._board_trusted = False
                 continue
 
             if self.ai_engine == "cold_clear":
-                from cold_clear import confirm_pending_placement
-                confirm_pending_placement(self.cc_binary, self.cc_weights)
+                # Ghost off before capture — cyan fill would corrupt the check.
+                self._clear_ghost()
+                time.sleep(0.02)
+                matched, actual_m, exp_m = self._board_matches_expected(
+                    expected_board, quick=(mode == "autodrop")
+                )
+                if matched:
+                    from cold_clear import confirm_pending_placement
+                    confirm_pending_placement(self.cc_binary, self.cc_weights)
+                    self._board_trusted = True
+                else:
+                    from cold_clear import cancel_pending_placement, _board_diff_summary
+                    cancel_pending_placement(self.cc_binary, self.cc_weights)
+                    self._board_trusted = False
+                    try:
+                        detail = _board_diff_summary(
+                            np.flipud(actual_m), np.flipud(exp_m)
+                        )
+                    except Exception:
+                        detail = "mismatch"
+                    print(
+                        f"  AUTODROP MISS vs ghost — not confirming CC ({detail})",
+                        flush=True,
+                    )
+            else:
+                self._board_trusted = True
+                self._clear_ghost()
 
-            # Next piece can use calculated stack — no vision re-sync needed
-            # unless garbage arrives / user misses (then mismatch clears the flag).
-            self._board_trusted = True
             self._clear_ghost()
             if need_hold:
                 self.hold_used_this_piece = True
@@ -1724,6 +1882,8 @@ def bot_from_config(config, debug=False, pause_sec=0):
         spin_ruleset=config.get("spin_ruleset", "all_mini_plus"),
         cc_think_ms=config.get("cc_think_ms", 50),
         trust_expected_board=config.get("trust_expected_board", True),
+        simple_placements=config.get("simple_placements", False),
+        show_autodrop_ghost=config.get("show_autodrop_ghost", True),
     )
 
 

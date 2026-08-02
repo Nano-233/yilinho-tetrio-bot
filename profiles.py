@@ -33,6 +33,8 @@ DEFAULT_AI = {
     "spin_ruleset": "all_mini_plus",
     "cc_think_ms": 50,
     "trust_expected_board": True,
+    "simple_placements": False,
+    "show_autodrop_ghost": True,
 }
 
 
@@ -61,6 +63,8 @@ def normalize_profile(config):
     config.setdefault("spin_ruleset", DEFAULT_AI["spin_ruleset"])
     config.setdefault("cc_think_ms", DEFAULT_AI["cc_think_ms"])
     config.setdefault("trust_expected_board", DEFAULT_AI["trust_expected_board"])
+    config.setdefault("simple_placements", DEFAULT_AI["simple_placements"])
+    config.setdefault("show_autodrop_ghost", DEFAULT_AI["show_autodrop_ghost"])
     binds = dict(DEFAULT_KEYBINDS)
     binds.update(config.get("keybinds") or {})
     config["keybinds"] = binds

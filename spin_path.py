@@ -303,6 +303,7 @@ def find_path(
     *,
     require_rotate_last: bool = False,
     allow_180: bool = True,
+    allow_soft_drop: bool = True,
 ) -> Optional[list]:
     """BFS to target lock. Returns input list ending with 'hd', or None.
 
@@ -310,6 +311,10 @@ def find_path(
 
     A rotate-last path means the piece arrives at the exact resting target via
     a rotation (SRS kick into the pocket) — required for spin credit.
+
+    allow_soft_drop=False: only rotates/shifts then hard-drop (no mid-air tucks).
+    Prefer this first — BFS otherwise treats sonic-SD as one cheap edge and
+    picks tucks over longer kick sequences.
     """
     board = pad_board(board_20)
     if target_orient not in ORIENT_INDEX:
@@ -336,28 +341,49 @@ def find_path(
         q.append(st)
 
     def consider_lock(x, y, rot):
+        """Lock if hard-drop from here lands on the target.
+
+        TETR.IO hard-drop sonics: reaching (target_x, target_rot) at *any*
+        height is enough — no soft-drop needed. Requiring y==target_y made
+        BFS soft-drop early then rotate on the floor (I/S/Z left/right miss).
+        """
         nonlocal found_spin, found_any
-        if x != target_x or y != target_y or rot != tgt_rot:
+        if x != target_x or rot != tgt_rot:
             return
-        # Must already be resting
-        if valid(board, piece, x, y - 1, ORIENTS[rot]):
+        orient = ORIENTS[rot]
+        if sonic_drop_y(board, piece, x, y, orient) != target_y:
             return
         _, last_action, last_kick = parent[(x, y, rot)]
+        # Spin credit needs the rotate to happen at rest (kick into pocket).
+        at_rest = not valid(board, piece, x, y - 1, orient)
         ends_rot = last_action in (CW, CCW, ROT180)
         inputs = _reconstruct(parent, (x, y, rot))
         inputs.append(HD)
-        if ends_rot:
-            found_spin = (inputs, last_kick)
+        if ends_rot and at_rest:
+            if found_spin is None:
+                found_spin = (inputs, last_kick)
         elif found_any is None:
+            # SD-at-rest is dominated by HD from the pre-SD air state
+            if last_action == SD:
+                return
             found_any = (inputs, last_kick)
 
     while q:
-        if found_spin is not None:
+        # BFS: first hit is shortest. Do NOT keep searching for a spin ending
+        # when one isn't required — that produced 40-step rot180 spam paths.
+        if require_rotate_last:
+            if found_spin is not None:
+                break
+        elif found_any is not None or found_spin is not None:
             break
+
         x, y, rot = q.popleft()
         orient = ORIENTS[rot]
         consider_lock(x, y, rot)
-        if found_spin is not None:
+        if require_rotate_last:
+            if found_spin is not None:
+                break
+        elif found_any is not None or found_spin is not None:
             break
 
         if piece != "O":
@@ -379,22 +405,25 @@ def find_path(
         if valid(board, piece, x + 1, y, orient):
             try_enqueue(x + 1, y, rot, RIGHT, 0, (x, y, rot))
 
-        # Sonic soft-drop to rest (one compressed SD edge)
-        ly = sonic_drop_y(board, piece, x, y, orient)
-        if ly != y:
-            try_enqueue(x, ly, rot, SD, 0, (x, y, rot))
-        elif valid(board, piece, x, y - 1, orient):
-            try_enqueue(x, y - 1, rot, SD, 0, (x, y, rot))
+        if allow_soft_drop:
+            # Sonic soft-drop to rest (one compressed SD edge)
+            ly = sonic_drop_y(board, piece, x, y, orient)
+            if ly != y:
+                try_enqueue(x, ly, rot, SD, 0, (x, y, rot))
+            elif valid(board, piece, x, y - 1, orient):
+                try_enqueue(x, y - 1, rot, SD, 0, (x, y, rot))
 
-    hit = found_spin
-    if hit is None and not require_rotate_last:
-        hit = found_any
-    if hit is None:
-        # Last resort: any path even when spin was requested
-        hit = found_any
+    if require_rotate_last:
+        hit = found_spin or found_any
+    else:
+        # Prefer shortest non-spin; spin only if that's all we found
+        hit = found_any or found_spin
     if hit is None:
         return None
-    return _compress_sd(hit[0])
+    path = _compress_for_execution(_compress_sd(hit[0]))
+    if len(path) > MAX_PATH_LEN:
+        return None
+    return path
 
 
 def _reconstruct(parent, state) -> list:
@@ -419,8 +448,46 @@ def _compress_sd(inputs: list) -> list:
     return out
 
 
-def path_for_placement(board_20, placement: dict, ruleset: str) -> Optional[list]:
-    """Path to a TBP placement; rotate-last if ruleset would credit a spin."""
+def _compress_for_execution(inputs: list) -> list:
+    """Trailing sd+hd → hd only (hard-drop sonics in TETR.IO; avoids soft-drop key)."""
+    if len(inputs) >= 2 and inputs[-2] == SD and inputs[-1] == HD:
+        return inputs[:-2] + [HD]
+    return inputs
+
+
+MAX_PATH_LEN = 14  # longer = unusable within lock delay / pathfinder bug
+
+
+def path_ok(path: Optional[list]) -> bool:
+    return bool(path) and len(path) <= MAX_PATH_LEN
+
+
+def path_needs_tuck(path: Optional[list]) -> bool:
+    """True if path soft-drops then keeps moving/rotating (not just SD→HD)."""
+    if not path or SD not in path:
+        return False
+    seen_sd = False
+    for a in path:
+        if a == SD:
+            seen_sd = True
+            continue
+        if seen_sd and a != HD:
+            return True
+    return False
+
+
+def path_for_placement(
+    board_20,
+    placement: dict,
+    ruleset: str,
+    *,
+    simple_only: bool = False,
+) -> Optional[list]:
+    """Path to a TBP placement; prefer kick/rotate paths over soft-drop tucks.
+
+    Tries allow_soft_drop=False first (hard-drop / kicks only). Falls back to
+    soft-drop tucks unless simple_only=True.
+    """
     loc = placement["location"]
     piece = loc["type"]
     orient = loc["orientation"]
@@ -429,14 +496,33 @@ def path_for_placement(board_20, placement: dict, ruleset: str) -> Optional[list
     # Drive off our ruleset, not CC's tag — CC may label spins that TETR.IO
     # won't credit under t_spins / none.
     need = would_spin(ruleset, piece, board, x, y, orient)
-    path = find_path(
-        board_20, piece, x, y, orient, require_rotate_last=need
-    )
-    if path is None and need:
-        path = find_path(
-            board_20, piece, x, y, orient, require_rotate_last=False
+
+    def _try(allow_sd: bool, require_rot: bool):
+        return find_path(
+            board_20,
+            piece,
+            x,
+            y,
+            orient,
+            require_rotate_last=require_rot,
+            allow_soft_drop=allow_sd,
         )
-    return path
+
+    # 1) Kick/rotate into place without soft-drop (spins / kicks)
+    path = _try(False, need)
+    if path is None and need:
+        path = _try(False, False)
+    if path is not None and path_ok(path):
+        return path
+    if simple_only:
+        return None
+    # 2) Allow soft-drop (normal gravity placements + tucks)
+    path = _try(True, need)
+    if path is None and need:
+        path = _try(True, False)
+    if path is not None and path_ok(path):
+        return path
+    return None
 
 
 def classify_placement(board_20, placement: dict, ruleset: str, *, last_was_rotate: bool) -> str:

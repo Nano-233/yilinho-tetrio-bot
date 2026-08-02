@@ -28,8 +28,8 @@
     719,
     348
   ],
-  "move_delay_ms": 30,
-  "action_delay_ms": 50,
+  "move_delay_ms": 16,
+  "action_delay_ms": 16,
   "delay_variance_percent": 20,
   "keybinds": {
     "move_left": "a",
@@ -46,7 +46,9 @@
   "pruning_breadth": 5,
   "ai_engine": "cold_clear",
   "spin_ruleset": "all_mini_plus",
-  "play_mode": "suggest",
+  "play_mode": "autodrop",
   "cc_think_ms": 0,
-  "trust_expected_board": true
+  "trust_expected_board": true,
+  "simple_placements": false,
+  "show_autodrop_ghost": true
 }
