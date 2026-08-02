@@ -317,11 +317,11 @@ QUEUE_READ_DELAY = 0.025
 MAX_UNREADABLE_POLLS = 40
 SPAWN_MASK_ROWS = 4       # top rows — active piece lives here, hide from AI
 LOCK_SETTLE_SEC = 0.05    # wait after hard drop before next read
-BOARD_STABLE_TRIES = 6
-BOARD_STABLE_GAP = 0.04
+BOARD_STABLE_TRIES = 4
+BOARD_STABLE_GAP = 0.025
 SPAWN_COLUMN = 3          # default piece spawn column for movement math (legacy left-edge)
 SPAWN_CENTER_X = 4        # guideline SRS center x (Cold Clear / TBP)
-SPAWN_SETTLE_SEC = 0.06   # wait after queue shift before reading pieces
+SPAWN_SETTLE_SEC = 0.035  # wait after queue shift before reading pieces
 MIN_INPUT_GAP_SEC = 0.001   # ~1 frame when move/action delay is 0
 DEFAULT_PAUSE_SEC = 3.0   # --pause: seconds to wait before each drop
 
@@ -776,6 +776,7 @@ class TetrioBot:
         play_mode="autodrop",
         spin_ruleset="all_mini_plus",
         cc_think_ms=50,
+        trust_expected_board=True,
     ):
         self.keys = dict(DEFAULT_KEYBINDS)
         if keybinds:
@@ -792,10 +793,14 @@ class TetrioBot:
             self.spin_ruleset = normalize_ruleset(spin_ruleset)
         except Exception:
             self.spin_ruleset = spin_ruleset or "all_mini_plus"
-        self.cc_think_ms = cc_think_ms or 50
+        self.cc_think_ms = 50 if cc_think_ms is None else int(cc_think_ms)
+        self.trust_expected_board = bool(trust_expected_board)
         # Optional callback: publish_ghost([(col, row_top), ...], label)
         self.publish_ghost = None
         self._cc_ai_board = None  # bottom-up board at last CC decision
+        # After a confirmed placement, next cycle uses calculated expected board
+        # instead of re-reading vision (spawn settle + stable capture).
+        self._board_trusted = False
         self.screen_offset = screen_offset
         self.screen_resolution = screen_resolution
         self.board_top_left = board_top_left
@@ -902,7 +907,10 @@ class TetrioBot:
         if "cc_weights" in config:
             self.cc_weights = config.get("cc_weights")
         if "cc_think_ms" in config:
-            self.cc_think_ms = config.get("cc_think_ms") or 50
+            v = config.get("cc_think_ms")
+            self.cc_think_ms = 50 if v is None else int(v)
+        if "trust_expected_board" in config:
+            self.trust_expected_board = bool(config.get("trust_expected_board"))
         if "spin_ruleset" in config:
             try:
                 from spin_path import normalize_ruleset
@@ -1324,7 +1332,9 @@ class TetrioBot:
             print(f"Cold Clear diagnostics will be written to {LOG_PATH}", flush=True)
 
         print("TetrioBot started. Waiting for game...", flush=True)
-        print(f"  engine={self.ai_engine}  spin_ruleset={getattr(self, 'spin_ruleset', '?')}",
+        print(f"  engine={self.ai_engine}  spin_ruleset={getattr(self, 'spin_ruleset', '?')}"
+              f"  cc_think_ms={self.cc_think_ms}  play_mode={self.play_mode}"
+              f"  trust_board={self.trust_expected_board}",
               flush=True)
         print(
             f"  input={'pydirectinput' if _USE_DIRECT_INPUT else 'pyautogui (install pydirectinput)'}",
@@ -1392,35 +1402,56 @@ class TetrioBot:
                 time.sleep(0.05)
                 continue
             unreadable = 0
-            time.sleep(SPAWN_SETTLE_SEC)
-            if self._stop:
-                break
-
             # Falling piece = old next[0] before the queue shifted (queue inference
             # is reliable). Board color read fails on custom backgrounds — the
             # orange sky reads as L every time — so we don't use it.
             falling_piece = queue_piece
             current_piece = falling_piece
 
-            # Stable read: line-clear / lock flash mid-frame corrupts CC expected.
-            raw_board = self._read_stable_board()
-            if self.board_looks_obscured():
-                print(
-                    "Board looks obscured (window unfocused / covered?) — waiting.",
-                    flush=True,
-                )
-                time.sleep(0.25)
+            # Happy path (opt-in): last placement confirmed → reuse calculated stack.
+            # One-frame peek still catches garbage/desync without spawn-settle.
+            use_trust = self.trust_expected_board and self._board_trusted
+            if use_trust:
                 self.refresh_screen_image()
-                # Restore pre-shift queue so we retry this piece instead of
-                # consuming the queue change and never emitting a ghost.
-                last_next_pieces = prev_queue
-                continue
-            # The falling piece sits in the top rows — including it makes the AI
-            # think the stack is taller/wrong shape and pick bad placements.
-            current_board = raw_board.copy()
-            current_board[0:SPAWN_MASK_ROWS, :] = 0
-            if not np.all(np.equal(raw_board, expected_board)):
-                expected_board = raw_board.copy()
+                peek = self.get_tetris_board()
+                peek_m = peek.copy()
+                peek_m[0:SPAWN_MASK_ROWS, :] = 0
+                exp_m = expected_board.copy()
+                exp_m[0:SPAWN_MASK_ROWS, :] = 0
+                if np.array_equal(peek_m, exp_m):
+                    current_board = exp_m
+                    raw_board = expected_board
+                else:
+                    print(
+                        "  board peek mismatch (garbage/desync?) — vision resync",
+                        flush=True,
+                    )
+                    self._board_trusted = False
+                    use_trust = False
+            if not use_trust:
+                time.sleep(SPAWN_SETTLE_SEC)
+                if self._stop:
+                    break
+                # Stable read: line-clear / lock flash mid-frame corrupts CC expected.
+                raw_board = self._read_stable_board()
+                if self.board_looks_obscured():
+                    print(
+                        "Board looks obscured (window unfocused / covered?) — waiting.",
+                        flush=True,
+                    )
+                    time.sleep(0.25)
+                    self.refresh_screen_image()
+                    # Restore pre-shift queue so we retry this piece instead of
+                    # consuming the queue change and never emitting a ghost.
+                    last_next_pieces = prev_queue
+                    self._board_trusted = False
+                    continue
+                # The falling piece sits in the top rows — including it makes the AI
+                # think the stack is taller/wrong shape and pick bad placements.
+                current_board = raw_board.copy()
+                current_board[0:SPAWN_MASK_ROWS, :] = 0
+                if not np.all(np.equal(raw_board, expected_board)):
+                    expected_board = raw_board.copy()
 
             held_piece = self.read_held_piece()
             # Empty hold at game start is normal — CC treats hold=null correctly.
@@ -1481,6 +1512,7 @@ class TetrioBot:
 
             if score < -50000:
                 expected_board = raw_board.copy()
+                self._board_trusted = False
                 continue
 
             place_piece = falling_piece
@@ -1612,6 +1644,7 @@ class TetrioBot:
                     if not placed and self.ai_engine == "cold_clear":
                         from cold_clear import cancel_pending_placement
                         cancel_pending_placement(self.cc_binary, self.cc_weights)
+                        self._board_trusted = False
                     break
 
             if not placed:
@@ -1623,17 +1656,20 @@ class TetrioBot:
                 from cold_clear import confirm_pending_placement
                 confirm_pending_placement(self.cc_binary, self.cc_weights)
 
+            # Next piece can use calculated stack — no vision re-sync needed
+            # unless garbage arrives / user misses (then mismatch clears the flag).
+            self._board_trusted = True
             self._clear_ghost()
             if need_hold:
                 self.hold_used_this_piece = True
                 self.last_held_piece = falling_piece
-            # Extra settle when the placement cleared lines (stack shrank).
-            settle = (
-                get_delay_with_variance(
+            # Short settle only for autodrop key timing / clear anim before next
+            # queue poll — not for re-reading the board when trusted.
+            settle = LOCK_SETTLE_SEC
+            if self.play_mode == "autodrop":
+                settle += get_delay_with_variance(
                     self.action_delay_ms, self.delay_variance_percent
                 )
-                + LOCK_SETTLE_SEC
-            )
             if int(expected_board.sum()) < int(current_board.sum()):
                 settle += CLEAR_SETTLE_SEC
             time.sleep(settle)
@@ -1687,6 +1723,7 @@ def bot_from_config(config, debug=False, pause_sec=0):
         play_mode=config.get("play_mode", "autodrop"),
         spin_ruleset=config.get("spin_ruleset", "all_mini_plus"),
         cc_think_ms=config.get("cc_think_ms", 50),
+        trust_expected_board=config.get("trust_expected_board", True),
     )
 
 

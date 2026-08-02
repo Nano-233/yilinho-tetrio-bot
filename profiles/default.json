@@ -47,5 +47,6 @@
   "ai_engine": "cold_clear",
   "spin_ruleset": "all_mini_plus",
   "play_mode": "suggest",
-  "cc_think_ms": 150
+  "cc_think_ms": 0,
+  "trust_expected_board": true
 }

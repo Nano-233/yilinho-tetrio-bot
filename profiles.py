@@ -32,6 +32,7 @@ DEFAULT_AI = {
     "ai_engine": "legacy",  # "legacy" | "cold_clear"
     "spin_ruleset": "all_mini_plus",
     "cc_think_ms": 50,
+    "trust_expected_board": True,
 }
 
 
@@ -59,6 +60,7 @@ def normalize_profile(config):
     config.setdefault("ai_engine", DEFAULT_AI["ai_engine"])
     config.setdefault("spin_ruleset", DEFAULT_AI["spin_ruleset"])
     config.setdefault("cc_think_ms", DEFAULT_AI["cc_think_ms"])
+    config.setdefault("trust_expected_board", DEFAULT_AI["trust_expected_board"])
     binds = dict(DEFAULT_KEYBINDS)
     binds.update(config.get("keybinds") or {})
     config["keybinds"] = binds

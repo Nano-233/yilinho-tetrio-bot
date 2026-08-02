@@ -626,6 +626,16 @@ class ControlPanel(QtWidgets.QMainWindow):
             "Sleep before each Cold Clear suggest() so CC accumulates search nodes."
         )
         form.addRow("CC think time", self.cc_think_ms)
+        self.trust_expected = QtWidgets.QCheckBox(
+            "Trust expected board (faster; peek catches garbage)"
+        )
+        self.trust_expected.setChecked(True)
+        self.trust_expected.setToolTip(
+            "After a confirmed placement, reuse the calculated stack instead of "
+            "spawn-settle + full vision resync. A one-frame peek still detects "
+            "garbage/desync and falls back to vision. Uncheck if ghosts look wrong."
+        )
+        form.addRow("", self.trust_expected)
         self.ai_legacy.toggled.connect(self._sync_legacy_ai_controls)
         self.ai_cc.toggled.connect(self._sync_legacy_ai_controls)
         self._legacy_ai_widgets = (self.mp, self.pruning_moves, self.pruning_breadth)
@@ -735,6 +745,8 @@ class ControlPanel(QtWidgets.QMainWindow):
             cfg["spin_ruleset"] = self.spin_ruleset.currentData() or "all_mini_plus"
         if hasattr(self, "cc_think_ms"):
             cfg["cc_think_ms"] = self.cc_think_ms.value()
+        if hasattr(self, "trust_expected"):
+            cfg["trust_expected_board"] = self.trust_expected.isChecked()
         binds = dict(DEFAULT_KEYBINDS)
         for key, edit in self.game_bind_edits.items():
             val = edit.text().strip().lower()
@@ -800,6 +812,10 @@ class ControlPanel(QtWidgets.QMainWindow):
                 self.spin_ruleset.setCurrentIndex(idx)
         if hasattr(self, "cc_think_ms"):
             self.cc_think_ms.setValue(int(cfg.get("cc_think_ms", 50)))
+        if hasattr(self, "trust_expected"):
+            self.trust_expected.setChecked(
+                bool(cfg.get("trust_expected_board", True))
+            )
         self._sync_legacy_ai_controls()
         binds = cfg.get("keybinds") or {}
         for key, edit in self.game_bind_edits.items():
