@@ -17,20 +17,20 @@
     893
   ],
   "next_piece_xy_0": [
-    1228,
-    349
+    1201,
+    347
   ],
   "next_piece_xy_4": [
-    1225,
-    735
+    1201,
+    732
   ],
   "held_piece_xy": [
     719,
     348
   ],
-  "move_delay_ms": 0,
-  "action_delay_ms": 0,
-  "delay_variance_percent": 0,
+  "move_delay_ms": 30,
+  "action_delay_ms": 50,
+  "delay_variance_percent": 20,
   "keybinds": {
     "move_left": "a",
     "move_right": "d",
@@ -46,6 +46,6 @@
   "pruning_breadth": 5,
   "ai_engine": "cold_clear",
   "spin_ruleset": "all_mini_plus",
-  "play_mode": "autodrop",
-  "cc_think_ms": 50
+  "play_mode": "suggest",
+  "cc_think_ms": 150
 }

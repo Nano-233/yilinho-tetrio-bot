@@ -63,8 +63,8 @@ _STATE = {
 YELLOW = RgbaColor(255, 255, 0, 220)
 GREEN = RgbaColor(0, 255, 0, 220)
 PURPLE = RgbaColor(255, 0, 255, 220)
-GHOST_FILL = RgbaColor(0, 220, 255, 110)
-GHOST_OUTLINE = RgbaColor(0, 255, 255, 255)
+GHOST_FILL = RgbaColor(0, 255, 255, 200)
+GHOST_OUTLINE = RgbaColor(255, 255, 0, 255)  # yellow outline so cells pop on stack
 
 GAME_BIND_LABELS = [
     ("move_left", "Move left"),
@@ -133,6 +133,14 @@ def virtual_screen_rect():
     )
 
 
+OVERLAY_FLAGS = (
+    QtCore.Qt.FramelessWindowHint
+    | QtCore.Qt.WindowTransparentForInput
+    | QtCore.Qt.WindowStaysOnTopHint
+    | QtCore.Qt.Tool
+)
+
+
 def sync_overlay_geometry():
     """Place overlay on the profile's monitor (fallback: full virtual desktop).
 
@@ -143,17 +151,72 @@ def sync_overlay_geometry():
     if win is None:
         return
     cfg = _STATE.get("config") or {}
-    ox = oy = None
     if "screen_offset" in cfg and "screen_resolution" in cfg:
         ox, oy = cfg["screen_offset"]
         sw, sh = cfg["screen_resolution"]
         if sw > 0 and sh > 0:
             _STATE["virtual_origin"] = (int(ox), int(oy))
+            # hide→geometry→show: layered translucent windows often keep a
+            # stale primary-monitor buffer if moved while visible.
+            was = win.isVisible()
+            win.hide()
             win.setGeometry(int(ox), int(oy), int(sw), int(sh))
+            if was:
+                win.show()
             return
     vx, vy, vw, vh = virtual_screen_rect()
     _STATE["virtual_origin"] = (vx, vy)
+    was = win.isVisible()
+    win.hide()
     win.setGeometry(vx, vy, max(1, vw), max(1, vh))
+    if was:
+        win.show()
+
+
+def _force_topmost(win):
+    """Re-assert HWND_TOPMOST after show/move (Qt flags alone often lose)."""
+    try:
+        import ctypes
+        hwnd = int(win.winId())
+        HWND_TOPMOST = -1
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+    except Exception as e:
+        print(f"overlay SetWindowPos failed: {e}", flush=True)
+
+
+def show_overlay_window(reason=""):
+    """Make the click-through overlay visible on the game monitor."""
+    win = _STATE.get("overlay_win")
+    if win is None:
+        print("overlay: no window object", flush=True)
+        return
+    sync_overlay_geometry()
+    # Re-apply flags after geometry (setWindowFlags resets visibility).
+    win.setWindowFlags(OVERLAY_FLAGS)
+    win.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+    win.show()
+    win.raise_()
+    _force_topmost(win)
+    g = win.geometry()
+    nshapes = len(drawlist_callback())
+    msg = (
+        f"overlay show ({reason}): visible={win.isVisible()} "
+        f"geom=({g.x()},{g.y()} {g.width()}x{g.height()}) "
+        f"shapes={nshapes} origin={_STATE.get('virtual_origin')}"
+    )
+    print(msg, flush=True)
+    panel = _STATE.get("panel")
+    if panel is not None:
+        try:
+            panel._set_status(msg)
+        except Exception:
+            pass
 
 
 def _abs(config, xy):
@@ -169,16 +232,23 @@ def _local(abs_xy):
 
 def build_ghost_shapes(config, cells, label=""):
     """Cyan cells for the suggested landing position (col, row_top)."""
-    if not config or not cells:
+    if not config:
         return []
     left, top = _local(_abs(config, config["board_top_left"]))
     right, bottom = _local(_abs(config, config["board_bottom_right"]))
     w, h = right - left, bottom - top
     if w <= 0 or h <= 0:
         return []
+    shapes = []
+    if not cells:
+        # Still draw a banner so suggest mode is visibly "alive"
+        shapes.append(DrawText(
+            Vector2D(left, max(20, top - 8)),
+            16, label or "SUGGEST: waiting for piece…", "Arial", GHOST_OUTLINE, 1
+        ))
+        return shapes
     cell_w = w / NUM_COL
     cell_h = h / NUM_ROW
-    shapes = []
     for col, row in cells:
         if not (0 <= col < NUM_COL and 0 <= row < NUM_ROW):
             continue
@@ -187,12 +257,12 @@ def build_ghost_shapes(config, cells, label=""):
         cw = max(1, int(cell_w) - 1)
         ch = max(1, int(cell_h) - 1)
         shapes.append(FlDrawRect(
-            Vector2D(x, y), cw, ch, GHOST_FILL, GHOST_OUTLINE, 2
+            Vector2D(x, y), cw, ch, GHOST_FILL, GHOST_OUTLINE, 3
         ))
     if label:
         shapes.append(DrawText(
-            Vector2D(left, min(bottom + 16, top + h + 16)),
-            12, label, "Arial", GHOST_OUTLINE, 1
+            Vector2D(left, min(bottom + 20, top + h + 20)),
+            14, label, "Arial", GHOST_OUTLINE, 1
         ))
     return shapes
 
@@ -207,35 +277,42 @@ def build_overlay_shapes(config):
     w, h = right - left, bottom - top
     if w <= 0 or h <= 0:
         return shapes
-    shapes.append(SkDrawRect(Vector2D(left, top), w, h, YELLOW, 2))
+    # Thick board frame + corner markers so a dead window is obvious
+    shapes.append(SkDrawRect(Vector2D(left, top), w, h, YELLOW, 4))
+    shapes.append(FlDrawRect(
+        Vector2D(left, top), 24, 24, YELLOW, YELLOW, 1
+    ))
+    shapes.append(FlDrawRect(
+        Vector2D(right - 24, bottom - 24), 24, 24, YELLOW, YELLOW, 1
+    ))
     cell_w = w / NUM_COL
     cell_h = h / NUM_ROW
     for col in range(1, NUM_COL):
         x = int(left + col * cell_w)
-        shapes.append(DrawLine(Vector2D(x, top), Vector2D(x, bottom), YELLOW, 1))
+        shapes.append(DrawLine(Vector2D(x, top), Vector2D(x, bottom), YELLOW, 2))
     for row in range(1, NUM_ROW):
         y = int(top + row * cell_h)
-        shapes.append(DrawLine(Vector2D(left, y), Vector2D(right, y), YELLOW, 1))
+        shapes.append(DrawLine(Vector2D(left, y), Vector2D(right, y), YELLOW, 2))
     shapes.append(DrawText(
-        Vector2D(left, max(12, top - 4)), 12, "board", "Arial", YELLOW, 1
+        Vector2D(left, max(18, top - 6)), 14, "board OVERLAY", "Arial", YELLOW, 1
     ))
 
     half = _pixel_half(config)
     for i, (rx, ry) in enumerate(_next_slots(config)):
         ax, ay = _local(_abs(config, (rx, ry)))
         shapes.append(SkDrawRect(
-            Vector2D(ax - half, ay - half), half * 2, half * 2, GREEN, 2
+            Vector2D(ax - half, ay - half), half * 2, half * 2, GREEN, 3
         ))
         shapes.append(DrawText(
-            Vector2D(ax + half + 4, ay), 11, f"next{i}", "Arial", GREEN, 1
+            Vector2D(ax + half + 4, ay), 12, f"next{i}", "Arial", GREEN, 1
         ))
 
     hx, hy = _local(_abs(config, config["held_piece_xy"]))
     shapes.append(SkDrawRect(
-        Vector2D(hx - half, hy - half), half * 2, half * 2, PURPLE, 2
+        Vector2D(hx - half, hy - half), half * 2, half * 2, PURPLE, 3
     ))
     shapes.append(DrawText(
-        Vector2D(hx + half + 4, hy), 11, "held", "Arial", PURPLE, 1
+        Vector2D(hx + half + 4, hy), 12, "held", "Arial", PURPLE, 1
     ))
 
     shapes.extend(build_ghost_shapes(
@@ -245,18 +322,28 @@ def build_overlay_shapes(config):
 
 
 def drawlist_callback():
-    # Suggest ghost needs the overlay window; calib overlay is optional toggle.
-    has_ghost = bool(_STATE.get("ghost_cells"))
-    if not _STATE["overlay_enabled"] and not has_ghost:
+    try:
+        return _drawlist_inner()
+    except Exception:
+        traceback.print_exc()
         return []
-    if not _STATE["overlay_enabled"] and has_ghost:
-        # Draw only the ghost (no calib chrome) when overlay checkbox is off
-        return build_ghost_shapes(
-            _STATE["config"],
-            _STATE.get("ghost_cells") or [],
-            _STATE.get("ghost_label") or "",
-        )
-    return build_overlay_shapes(_STATE["config"])
+
+
+def _drawlist_inner():
+    # Suggest needs the overlay surface even before the first ghost.
+    has_ghost = bool(_STATE.get("ghost_cells"))
+    suggest = _STATE.get("play_mode") == "suggest"
+    if not _STATE["overlay_enabled"] and not has_ghost and not suggest:
+        return []
+    if _STATE["overlay_enabled"]:
+        return build_overlay_shapes(_STATE["config"])
+    # Ghost-only (or suggest waiting banner)
+    return build_ghost_shapes(
+        _STATE["config"],
+        _STATE.get("ghost_cells") or [],
+        _STATE.get("ghost_label")
+        or ("SUGGEST: waiting for piece…" if suggest else ""),
+    )
 
 
 class BotWorker(QtCore.QThread):
@@ -278,6 +365,7 @@ class BotWorker(QtCore.QThread):
             self.bot = bot_module.bot_from_config(self._config)
             self.bot.play_mode = _STATE.get("play_mode", "autodrop")
             self.bot.publish_ghost = _publish_ghost_from_bot
+            print(f"BotWorker: play_mode={self.bot.play_mode}", flush=True)
             self.bot.run()
         except Exception:
             # stop() kills the CC process to unblock — don't treat that as an error
@@ -377,6 +465,12 @@ class ControlPanel(QtWidgets.QMainWindow):
         self._capture_timer.setInterval(1000)
         self._capture_timer.timeout.connect(self._capture_tick)
 
+        # Ghost is published from the bot worker (no Qt); poll to show the window.
+        self._ghost_timer = QtCore.QTimer(self)
+        self._ghost_timer.setInterval(100)
+        self._ghost_timer.timeout.connect(self._ensure_ghost_window)
+        self._ghost_timer.start()
+
         QtCore.QTimer.singleShot(0, self._after_show)
 
     def _after_show(self):
@@ -437,7 +531,11 @@ class ControlPanel(QtWidgets.QMainWindow):
             self.mode_suggest.setChecked(True)
         else:
             self.mode_autodrop.setChecked(True)
+        # Must connect BOTH — only autodrop was wired, so clicking Suggest
+        # unchecked autodrop (handler returned on checked=False) and never
+        # set play_mode to suggest; bot kept autodropping.
         self.mode_autodrop.toggled.connect(self._on_play_mode_radio)
+        self.mode_suggest.toggled.connect(self._on_play_mode_radio)
         mode_row.addWidget(self.mode_autodrop)
         mode_row.addWidget(self.mode_suggest)
         mode_row.addStretch(1)
@@ -801,8 +899,27 @@ class ControlPanel(QtWidgets.QMainWindow):
                 sync_overlay_geometry()
                 win.show()
                 win.raise_()
-            elif not _STATE.get("ghost_cells"):
+            elif (
+                _STATE.get("play_mode") == "suggest"
+                or _STATE.get("ghost_cells")
+            ):
+                # Keep window up for cyan ghost (calib chrome toggles off via
+                # overlay_enabled; drawlist still paints ghost-only).
+                sync_overlay_geometry()
+                win.show()
+            else:
                 win.hide()
+
+    def _ensure_ghost_window(self):
+        """Show overlay surface whenever a suggest ghost is published."""
+        if not _STATE.get("ghost_cells"):
+            return
+        win = _STATE.get("overlay_win")
+        if win is None:
+            return
+        if not win.isVisible():
+            sync_overlay_geometry()
+            win.show()
 
     def toggle_overlay(self):
         self._set_overlay(not _STATE["overlay_enabled"])
@@ -826,17 +943,24 @@ class ControlPanel(QtWidgets.QMainWindow):
         self.mode_suggest.blockSignals(True)
         if mode == "suggest":
             self.mode_suggest.setChecked(True)
-            # Suggest needs a visible overlay surface for the ghost
-            if not _STATE["overlay_enabled"]:
-                self._set_overlay(True)
+            # Calib yellow grid is captured by bettercam and blocks AI reads.
+            # Suggest uses ghost-only drawing; keep the window, drop the chrome.
+            if _STATE.get("overlay_enabled"):
+                self._set_overlay(False)
+            show_overlay_window("suggest")
         else:
             self.mode_autodrop.setChecked(True)
             _STATE["ghost_cells"] = []
             _STATE["ghost_label"] = ""
+            if not _STATE.get("overlay_enabled"):
+                win = _STATE.get("overlay_win")
+                if win is not None:
+                    win.hide()
         self.mode_autodrop.blockSignals(False)
         self.mode_suggest.blockSignals(False)
         if self.worker is not None:
             self.worker.set_play_mode(mode)
+        print(f"Play mode set: {mode}", flush=True)
         self._set_status(f"Play mode: {mode}")
 
     # --- Calibration capture ---
@@ -917,12 +1041,18 @@ class ControlPanel(QtWidgets.QMainWindow):
         self.stop_btn.setEnabled(True)
         mode = _STATE.get("play_mode", "autodrop")
         # Show overlay on the UI thread (never from BotWorker).
-        if mode == "suggest" or _STATE.get("overlay_enabled"):
-            win = _STATE.get("overlay_win")
-            if win is not None:
-                sync_overlay_geometry()
-                win.show()
-        self._set_status(f"Running ({mode})")
+        # Suggest: ghost-only — yellow calib chrome is captured by bettercam and
+        # makes the board look "obscured", so the bot never emits a ghost.
+        if mode == "suggest":
+            if _STATE.get("overlay_enabled"):
+                self._set_overlay(False)
+            show_overlay_window("start-suggest")
+            self._set_status("Running (suggest) — place on cyan ghost; Overlay chrome off")
+        elif _STATE.get("overlay_enabled"):
+            show_overlay_window("start-overlay")
+            self._set_status(f"Running ({mode})")
+        else:
+            self._set_status(f"Running ({mode})")
         self.worker.start()
 
     def stop_bot(self):
